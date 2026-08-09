@@ -1,10 +1,12 @@
-# daakLOLILE
+# DAAK Node Hub
 
 <p align="center">
   <img src="docs/hero.svg" width="100%" alt="daakLOLILE — private relay and hardware control plane">
 </p>
 
-**A privacy-first Windows Tor relay dashboard, PC hardware monitor, safe power-mode controller, desktop widget, and macOS menu bar companion.**
+**One privacy-first macOS menu bar hub for DAAK NODE devices, built from the daakLOLILE control plane.**
+
+DAAK Node Hub is an independent continuation of [daakLOLILE](https://github.com/benfirad/daakLOLILE). It keeps the original Windows relay and power-control integration while adding a unified, extensible device selector for the Galaxy S9+ DAAK NODE, DAAK Find, private SSH, and live-screen access. The original daakLOLILE repository remains unchanged.
 
 [Türkçe dokümantasyon](docs/README.tr.md)
 
@@ -13,7 +15,7 @@
 [![Tor non-exit](https://img.shields.io/badge/Tor-middle%20relay-7D4698?logo=torproject)](https://community.torproject.org/relay/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-daakLOLILE combines live Tor middle-relay traffic, Snowflake proxy statistics, Folding@home, BOINC, RIPE Atlas, CPU/GPU/RAM/disk/network telemetry, estimated power use, safe automatic peak-hour power modes, a small Windows desktop widget, and a macOS menu bar app. Remote access and power control are designed for a private [Tailscale](https://tailscale.com/) network.
+daakLOLILE combines live Tor middle-relay traffic, Snowflake proxy statistics, Folding@home, BOINC, RIPE Atlas, CPU/GPU/RAM/disk/network telemetry, estimated power use, safe automatic peak-hour power modes, a small Windows desktop widget, and the unified DAAK NODE macOS menu bar app. The Mac hub keeps LOLİLE and an enrolled Galaxy S9+ behind one menu bar icon. Remote access, power control, SSH, live-screen access, and DAAK Find are designed for a private [Tailscale](https://tailscale.com/) network.
 
 The compact desktop widget keeps only total support, Tor/Snowflake health, volunteer projects, power mode, CPU, and GPU visible. Two dynamic Windows notification-area icons remain available when the card is hidden: one color-coded health indicator and one enlarged, borderless numeric watt icon sized to fill the native Windows tray slot. Closing the card hides it without ending the background process or either tray icon. Both icons can show or hide the card. Slow Windows-service and Tor-directory checks refresh in the background, so they cannot stall the local panel API or cause false disconnect warnings.
 
@@ -91,9 +93,12 @@ http://100.x.y.z:17657
 1. Install and connect Tailscale on both devices.
 2. Copy the `macos` folder to the Mac.
 3. In Terminal, run `zsh build.command` from that folder.
-4. Enter the Windows PC's Tailscale IP in daakLOLILE and choose **Connect**.
-5. Switch between automatic, night-saving, balanced, and high-performance modes from the menu bar.
-6. Optionally move `build/daakLOLILE.app` to Applications and add it under **System Settings → General → Login Items**.
+4. Enter the Windows PC's Tailscale IP in the LOLİLE device panel and choose **Connect**.
+5. Use the single DAAK NODE menu bar icon to switch between the device overview, LOLİLE, and the enrolled Galaxy S9+.
+6. Switch between automatic, night-saving, balanced, and high-performance modes from the LOLİLE panel.
+7. Optionally move `build/daakLOLILE.app` to Applications and add it under **System Settings → General → Login Items**.
+
+The optional S9+ actions require the local DAAK Find client plus `adb` and `scrcpy`. They use fixed, argument-only commands over the phone's private Tailscale addresses; the app does not expose a new network service. **Find on map** remains unavailable until the phone has produced a real GPS fix. Location data is not sent to the Windows dashboard.
 
 The Mac app reads monitoring data and can call only the constrained power-mode endpoint. It does not run a relay or proxy on the Mac and cannot change Tor settings.
 

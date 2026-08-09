@@ -1,10 +1,10 @@
-# daakLOLILE — Türkçe
+# DAAK Node Hub — Türkçe
 
 <p align="center">
   <img src="hero.svg" width="100%" alt="daakLOLILE — özel relay ve donanım kontrol paneli">
 </p>
 
-daakLOLILE; Windows üzerinde çalışan Tor middle/non-exit relay, Snowflake, bilgisayar donanımı ve güvenli güç modlarını tek panelden yönetir. Küçük bir Windows masaüstü bileşeni ve Tailscale üzerinden çalışan macOS üst menü uygulaması içerir.
+DAAK Node Hub, [daakLOLILE](https://github.com/benfirad/daakLOLILE) kontrol düzleminin bağımsız devamıdır. Özgün daakLOLILE reposunu değiştirmeden LOLİLE ile kayıtlı Galaxy S9+'ı tek üst menü ikonunda birleştirir; Windows relay, donanım ve güvenli güç kontrollerini korur.
 
 ## Özellikler
 
@@ -19,6 +19,7 @@ daakLOLILE; Windows üzerinde çalışan Tor middle/non-exit relay, Snowflake, b
 - Tailscale üzerinden otomatik, tasarruf, dengeli ve yüksek performans geçişi
 - Tasarruf modunda bile uyku, hibernasyon ve ağ kesintisinin kapalı tutulması
 - Tailscale adres aralıklarıyla sınırlı uzaktan panel
+- Tek üst menü ikonundan LOLİLE paneli, S9+ SSH, canlı ekran ve DAAK Find erişimi
 
 ## Güvenlik
 
@@ -62,7 +63,9 @@ xcode-select --install
 zsh build.command
 ```
 
-Uygulama açıldığında Windows bilgisayarının Tailscale IP'sini yazın. Mac uygulaması verileri okur ve yalnızca önceden tanımlı güç modları arasında geçiş yapabilir; Mac üzerinde relay çalıştırmaz ve Tor ayarlarını değiştiremez.
+Uygulama açıldığında tek DAAK NODE ikonundan **Cihazlar**, **LOLİLE** ve **S9+** panelleri arasında geçebilirsiniz. LOLİLE paneline Windows bilgisayarının Tailscale IP'sini yazın. S9+ paneli kayıtlı telefona SSH, `adb`/`scrcpy` ile canlı ekran ve yerel DAAK Find istemcisi üzerinden konum erişimi sunar. Harita düğmesi gerçek GPS koordinatı alınana kadar etkinleşmez; konum Windows paneline gönderilmez ve yeni bir ağ servisi açılmaz.
+
+Mac uygulaması Windows verilerini okur ve yalnızca önceden tanımlı güç modları arasında geçiş yapabilir; Mac üzerinde relay çalıştırmaz ve Tor ayarlarını değiştiremez.
 
 ## Güvenli güç modları
 

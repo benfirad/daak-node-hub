@@ -223,6 +223,193 @@ private struct RelayStatus: Decodable {
     let volunteer: Volunteer?
 }
 
+private struct NodeStatus: Decodable {
+    let schema: Int
+    let state: String
+    let updatedAt: TimeInterval
+    let lastSuccessAt: TimeInterval
+    let consecutiveFailures: Int
+    let lastError: String?
+}
+
+private struct CommandResult: Sendable {
+    let exitCode: Int32
+    let output: String
+}
+
+private enum LocalCommand {
+    static func run(_ executable: String, _ arguments: [String]) async -> CommandResult {
+        await Task.detached(priority: .utility) {
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                return CommandResult(
+                    exitCode: process.terminationStatus,
+                    output: String(decoding: data, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            } catch {
+                return CommandResult(exitCode: 127, output: error.localizedDescription)
+            }
+        }.value
+    }
+
+    static func launch(_ executable: String, _ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        try process.run()
+    }
+}
+
+@MainActor
+private final class NodeMonitor: ObservableObject {
+    @Published private(set) var status: NodeStatus?
+    @Published private(set) var lastError: String?
+    @Published private(set) var actionMessage: String?
+    @Published private(set) var isRefreshing = false
+    @Published var host: String
+
+    private let hostKey = "daakNodeHost"
+    private let sshPort = "8022"
+    private let adbPort = "5555"
+    private var timer: Timer?
+
+    init() {
+        host = UserDefaults.standard.string(forKey: hostKey) ?? ""
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
+        }
+        Task { await refresh() }
+    }
+
+    deinit {
+        timer?.invalidate()
+    }
+
+    var isOnline: Bool { status != nil }
+    var hasLocation: Bool { (status?.lastSuccessAt ?? 0) > 0 }
+
+    var stateLabel: String {
+        guard let status else { return "Bağlantı bekleniyor" }
+        switch status.state {
+        case "ready": return "Konum hazır"
+        case "waiting-for-gps": return "GPS sabitleniyor"
+        case "permission-required": return "Konum izni gerekli"
+        default: return status.state.replacingOccurrences(of: "-", with: " ").capitalized
+        }
+    }
+
+    var lastLocationLabel: String {
+        guard let timestamp = status?.lastSuccessAt, timestamp > 0 else {
+            return "Henüz gerçek GPS koordinatı alınmadı"
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: Date(timeIntervalSince1970: timestamp), relativeTo: Date())
+    }
+
+    func saveAndRefresh() async {
+        host = Self.cleanedHost(host)
+        UserDefaults.standard.set(host, forKey: hostKey)
+        status = nil
+        lastError = nil
+        await refresh()
+    }
+
+    func refresh() async {
+        guard Self.isSafeHost(host) else {
+            status = nil
+            lastError = "DAAK NODE Tailscale IP’si geçerli değil."
+            return
+        }
+
+        isRefreshing = true
+        defer { isRefreshing = false }
+        let result = await LocalCommand.run("/usr/bin/ssh", sshArguments(remoteCommand: ".local/bin/daak-find status"))
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(NodeStatus.self, from: data) else {
+            status = nil
+            lastError = "S9’a ulaşılamadı. Tailscale ve Termux SSH bağlantısını kontrol et."
+            return
+        }
+        status = decoded
+        lastError = nil
+    }
+
+    func openFind() async {
+        guard hasLocation else {
+            actionMessage = "Harita için önce gerçek bir GPS koordinatı gerekiyor."
+            return
+        }
+        let result = await LocalCommand.run(NSHomeDirectory() + "/.local/bin/daak-find", ["open"])
+        actionMessage = result.exitCode == 0
+            ? "DAAK NODE haritada açıldı."
+            : "Konum açılamadı: \(result.output)"
+    }
+
+    func openLiveScreen() async {
+        guard Self.isSafeHost(host) else { return }
+        actionMessage = "S9 ekranına bağlanılıyor…"
+        let serial = "\(host):\(adbPort)"
+        let adb = await LocalCommand.run("/opt/homebrew/bin/adb", ["connect", serial])
+        guard adb.exitCode == 0 else {
+            actionMessage = "ADB bağlantısı kurulamadı: \(adb.output)"
+            return
+        }
+        do {
+            try LocalCommand.launch(
+                "/opt/homebrew/bin/scrcpy",
+                ["--serial", serial, "--no-audio", "--stay-awake", "--window-title", "DAAK NODE · Galaxy S9+"]
+            )
+            actionMessage = "Canlı ekran açıldı."
+        } catch {
+            actionMessage = "Canlı ekran açılamadı: \(error.localizedDescription)"
+        }
+    }
+
+    func openSSH() {
+        guard Self.isSafeHost(host), let url = URL(string: "ssh://\(host):\(sshPort)") else { return }
+        NSWorkspace.shared.open(url)
+        actionMessage = "S9 terminali açılıyor."
+    }
+
+    private func sshArguments(remoteCommand: String) -> [String] {
+        [
+            "-p", sshPort,
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=4",
+            "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=10",
+            "-o", "StrictHostKeyChecking=yes",
+            host,
+            remoteCommand
+        ]
+    }
+
+    private static func cleanedHost(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "ssh://", with: "", options: [.caseInsensitive, .anchored])
+            .split(separator: ":", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+    }
+
+    private static func isSafeHost(_ value: String) -> Bool {
+        let pattern = #"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$"#
+        return value.range(of: pattern, options: .regularExpression) != nil
+    }
+}
+
 @MainActor
 private final class RelayMonitor: ObservableObject {
     @Published private(set) var status: RelayStatus?
@@ -476,6 +663,342 @@ private struct MetricRow: View {
                 .textSelection(.enabled)
         }
         .font(.callout)
+    }
+}
+
+private enum DevicePanel: String, CaseIterable, Identifiable {
+    case devices
+    case lolile
+    case node
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .devices: return "Cihazlar"
+        case .lolile: return "LOLİLE"
+        case .node: return "S9+"
+        }
+    }
+}
+
+private struct DeviceCard: View {
+    let name: String
+    let detail: String
+    let symbol: String
+    let online: Bool
+    let status: String
+    let actionTitle: String
+    let action: () -> Void
+    let openDetails: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button(action: openDetails) {
+                HStack(spacing: 12) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(online ? Color.green : Color.orange)
+                        .frame(width: 38, height: 38)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(name)
+                            .font(.headline)
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    VStack(alignment: .trailing, spacing: 5) {
+                        Circle()
+                            .fill(online ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            HStack {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button(actionTitle, action: action)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(13)
+        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+private struct DeviceOverviewView: View {
+    @EnvironmentObject private var relay: RelayMonitor
+    @EnvironmentObject private var node: NodeMonitor
+    @Binding var selection: DevicePanel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Tüm cihazların tek güvenli merkezde")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            DeviceCard(
+                name: "LOLİLE",
+                detail: "Windows · Relay · Uzaktan kontrol",
+                symbol: "desktopcomputer",
+                online: relay.isConnected,
+                status: relay.isConnected ? "Tailscale üzerinden bağlı" : "Bağlantı bekleniyor",
+                actionTitle: "Paneli aç",
+                action: relay.openDashboard,
+                openDetails: { selection = .lolile }
+            )
+
+            DeviceCard(
+                name: "DAAK NODE",
+                detail: "Galaxy S9+ · Find · SSH · Canlı ekran",
+                symbol: "iphone",
+                online: node.isOnline,
+                status: node.stateLabel,
+                actionTitle: "Ekranı aç",
+                action: { Task { await node.openLiveScreen() } },
+                openDetails: { selection = .node }
+            )
+
+            HStack(spacing: 10) {
+                Image(systemName: "laptopcomputer")
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("BU MAC")
+                        .font(.caption.weight(.semibold))
+                    Text("DAAK cihaz kontrol merkezi")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("Yerel")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 4)
+
+            Divider()
+
+            HStack {
+                Button {
+                    Task {
+                        async let relayRefresh: Void = relay.refresh()
+                        async let nodeRefresh: Void = node.refresh()
+                        _ = await (relayRefresh, nodeRefresh)
+                    }
+                } label: {
+                    Label("Tümünü yenile", systemImage: "arrow.clockwise")
+                }
+                .disabled(relay.isRefreshing || node.isRefreshing)
+
+                Spacer()
+
+                Button("Çıkış") {
+                    NSApplication.shared.terminate(nil)
+                }
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(16)
+    }
+}
+
+private struct NodeMenuView: View {
+    @EnvironmentObject private var node: NodeMonitor
+    @State private var draftHost = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("DAAK NODE")
+                        .font(.headline)
+                    Text("Galaxy S9+ · özel Tailscale hattı")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(node.isOnline ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    Text(node.isOnline ? "Bağlı" : "Bekleniyor")
+                        .font(.caption.weight(.medium))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.quaternary, in: Capsule())
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Image(systemName: node.hasLocation ? "location.fill" : "location.slash")
+                        .foregroundStyle(node.hasLocation ? Color.green : Color.orange)
+                    Text(node.stateLabel)
+                        .font(.headline)
+                }
+                Text(node.lastLocationLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let detail = node.status?.lastError, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 12))
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await node.openFind() }
+                } label: {
+                    Label("Haritada bul", systemImage: "map")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!node.hasLocation)
+
+                Button {
+                    Task { await node.openLiveScreen() }
+                } label: {
+                    Label("Canlı ekran", systemImage: "rectangle.inset.filled.and.person.filled")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!node.isOnline)
+
+                Button {
+                    node.openSSH()
+                } label: {
+                    Label("SSH", systemImage: "terminal")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!node.isOnline)
+            }
+
+            if let message = node.actionMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = node.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("S9+ · Tailscale IP")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    TextField("100.x.x.x", text: $draftHost)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            node.host = draftHost
+                            Task { await node.saveAndRefresh() }
+                        }
+                    Button("Bağlan") {
+                        node.host = draftHost
+                        Task { await node.saveAndRefresh() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+
+            HStack {
+                Button {
+                    Task { await node.refresh() }
+                } label: {
+                    Label("Yenile", systemImage: "arrow.clockwise")
+                }
+                .disabled(node.isRefreshing)
+
+                Spacer()
+
+                Text("Konum dışarı açılmaz · yalnızca Tailnet")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(16)
+        .onAppear { draftHost = node.host }
+    }
+}
+
+private struct DAAKDevicesMenuView: View {
+    @EnvironmentObject private var relay: RelayMonitor
+    @EnvironmentObject private var node: NodeMonitor
+    @State private var selection: DevicePanel = .devices
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                Image(systemName: "circle.grid.2x2.fill")
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("DAAK NODE")
+                        .font(.headline)
+                    Text("Cihaz merkezi")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\([relay.isConnected, node.isOnline].filter { $0 }.count)/2 bağlı")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            Picker("Cihaz", selection: $selection) {
+                ForEach(DevicePanel.allCases) { panel in
+                    Text(panel.title).tag(panel)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+
+            Divider()
+
+            switch selection {
+            case .devices:
+                DeviceOverviewView(selection: $selection)
+            case .lolile:
+                ScrollView {
+                    RelayMenuView()
+                }
+                .frame(maxHeight: 690)
+            case .node:
+                NodeMenuView()
+            }
+        }
+        .frame(width: 420)
     }
 }
 
@@ -808,14 +1331,17 @@ private struct RelayMenuView: View {
 
 @main
 struct daakLOLILEApp: App {
-    @StateObject private var monitor = RelayMonitor()
+    @StateObject private var relay = RelayMonitor()
+    @StateObject private var node = NodeMonitor()
 
     var body: some Scene {
         MenuBarExtra {
-            RelayMenuView()
-                .environmentObject(monitor)
+            DAAKDevicesMenuView()
+                .environmentObject(relay)
+                .environmentObject(node)
         } label: {
-            Label(monitor.menuTitle, systemImage: monitor.isConnected ? "bolt.fill" : "bolt.slash")
+            Image(systemName: "circle.grid.2x2.fill")
+                .accessibilityLabel("DAAK NODE cihaz merkezi")
         }
         .menuBarExtraStyle(.window)
     }

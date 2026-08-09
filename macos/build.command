@@ -33,6 +33,7 @@ xcrun --sdk macosx swiftc \
   -framework AppKit
 
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
+xattr -cr "$APP"
 codesign --force --deep --sign - "$APP"
 
 echo ""
