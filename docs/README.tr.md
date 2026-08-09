@@ -63,6 +63,8 @@ xcode-select --install
 zsh build.command
 ```
 
+İmzalı uygulama varsayılan olarak `~/Library/Caches/DAAKNodeHub/build` altında üretilir; build komutu tam yolu ekrana yazar.
+
 Uygulama açıldığında tek DAAK NODE ikonundan **Cihazlar**, **LOLİLE** ve **S9+** panelleri arasında geçebilirsiniz. LOLİLE paneline Windows bilgisayarının Tailscale IP'sini yazın. S9+ paneli kayıtlı telefona SSH, `adb`/`scrcpy` ile canlı ekran ve yerel DAAK Find istemcisi üzerinden konum erişimi sunar. Harita düğmesi gerçek GPS koordinatı alınana kadar etkinleşmez; konum Windows paneline gönderilmez ve yeni bir ağ servisi açılmaz.
 
 Mac uygulaması Windows verilerini okur ve yalnızca önceden tanımlı güç modları arasında geçiş yapabilir; Mac üzerinde relay çalıştırmaz ve Tor ayarlarını değiştiremez.

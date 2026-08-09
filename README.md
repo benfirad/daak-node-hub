@@ -96,7 +96,7 @@ http://100.x.y.z:17657
 4. Enter the Windows PC's Tailscale IP in the LOLİLE device panel and choose **Connect**.
 5. Use the single DAAK NODE menu bar icon to switch between the device overview, LOLİLE, and the enrolled Galaxy S9+.
 6. Switch between automatic, night-saving, balanced, and high-performance modes from the LOLİLE panel.
-7. Optionally move `build/daakLOLILE.app` to Applications and add it under **System Settings → General → Login Items**.
+7. The build command prints the signed app path under `~/Library/Caches/DAAKNodeHub/build`. Optionally move the app to Applications and add it under **System Settings → General → Login Items**.
 
 The optional S9+ actions require the local DAAK Find client plus `adb` and `scrcpy`. They use fixed, argument-only commands over the phone's private Tailscale addresses; the app does not expose a new network service. **Find on map** remains unavailable until the phone has produced a real GPS fix. Location data is not sent to the Windows dashboard.
 

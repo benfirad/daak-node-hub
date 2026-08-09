@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="$ROOT/build"
+BUILD_DIR="${DAAK_NODE_BUILD_DIR:-$HOME/Library/Caches/DAAKNodeHub/build}"
 APP="$BUILD_DIR/daakLOLILE.app"
 CONTENTS="$APP/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
@@ -35,8 +35,9 @@ xcrun --sdk macosx swiftc \
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 xattr -cr "$APP"
 codesign --force --deep --sign - "$APP"
+xattr -cr "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo ""
 echo "Hazır: $APP"
-echo "Uygulama şimdi açılıyor."
-open "$APP"
+echo "Açmak için: open \"$APP\""
