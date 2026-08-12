@@ -100,6 +100,9 @@ http://100.x.y.z:17657
 
 The optional S9+ actions require the local DAAK Find client plus `adb` and `scrcpy`. They use fixed, argument-only commands over the phone's private Tailscale addresses; the app does not expose a new network service. **Find on map** remains unavailable until the phone has produced a real GPS fix. Location data is not sent to the Windows dashboard.
 
+The repository also includes a Tailscale-private, local-first mail platform for
+the always-on Intel Mac. See [the MYA-L11 mail guide](macos/server-mail/README.md).
+
 The Mac app reads monitoring data and can call only the constrained power-mode endpoint. It does not run a relay or proxy on the Mac and cannot change Tor settings.
 
 ## Safe power modes

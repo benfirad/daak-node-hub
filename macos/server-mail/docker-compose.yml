@@ -1,0 +1,137 @@
+name: mya-l11-core
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-listmonk-environment: &listmonk-environment
+  TZ: Europe/Madrid
+  LISTMONK_db__host: listmonk_db
+  LISTMONK_db__port: "5432"
+  LISTMONK_db__user: listmonk
+  LISTMONK_db__password: "${LISTMONK_DB_PASSWORD}"
+  LISTMONK_db__database: listmonk
+  LISTMONK_db__ssl_mode: disable
+
+services:
+  mailpit:
+    image: axllent/mailpit:v1.30.7
+    container_name: mailpit
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      MP_MAX_MESSAGES: "5000"
+      MP_DATABASE: /data/mailpit.db
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    volumes:
+      - mailpit_data:/data
+
+  listmonk_db:
+    image: postgres:17-alpine
+    container_name: listmonk_db
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      POSTGRES_DB: listmonk
+      POSTGRES_USER: listmonk
+      POSTGRES_PASSWORD: "${LISTMONK_DB_PASSWORD}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U listmonk -d listmonk"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - listmonk_db_data:/var/lib/postgresql/data
+
+  listmonk_init:
+    image: listmonk/listmonk:v6.2.0
+    restart: "no"
+    depends_on:
+      listmonk_db:
+        condition: service_healthy
+    command:
+      - sh
+      - -ec
+      - >-
+        ./listmonk --install --idempotent --yes --config '' &&
+        ./listmonk --upgrade --yes --config ''
+    environment:
+      <<: *listmonk-environment
+      LISTMONK_ADMIN_USER: "${LISTMONK_ADMIN_USER}"
+      LISTMONK_ADMIN_PASSWORD: "${LISTMONK_ADMIN_PASSWORD}"
+
+  listmonk_seed:
+    image: postgres:17-alpine
+    restart: "no"
+    depends_on:
+      listmonk_init:
+        condition: service_completed_successfully
+    environment:
+      PGPASSWORD: "${LISTMONK_DB_PASSWORD}"
+    command:
+      - psql
+      - --host=listmonk_db
+      - --username=listmonk
+      - --dbname=listmonk
+      - --set=ON_ERROR_STOP=1
+      - --file=/config/listmonk-safe-settings.sql
+    volumes:
+      - ./listmonk-safe-settings.sql:/config/listmonk-safe-settings.sql:ro
+
+  listmonk:
+    image: listmonk/listmonk:v6.2.0
+    container_name: listmonk
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      listmonk_seed:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
+    command: ["./listmonk", "--config", ""]
+    environment:
+      <<: *listmonk-environment
+      LISTMONK_app__address: "0.0.0.0:9000"
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16.17
+    container_name: stalwart
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      STALWART_PUBLIC_URL: "http://100.106.212.28:8080"
+      STALWART_RECOVERY_ADMIN: "${STALWART_RECOVERY_ADMIN}"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1587:587"
+      - "127.0.0.1:1993:993"
+    volumes:
+      - stalwart_etc:/etc/stalwart
+      - stalwart_data:/var/lib/stalwart
+
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+volumes:
+  listmonk_db_data:
+  mailpit_data:
+  stalwart_etc:
+  stalwart_data:
+  portainer_data:
