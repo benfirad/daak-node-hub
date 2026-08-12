@@ -8,6 +8,9 @@ data/
 .env
 .env.*
 !.env.example
+!.production.env.example
+.production.env
+.runtime/
 *.pem
 *.key
 control_auth_cookie
@@ -21,3 +24,4 @@ dist/
 .vscode/
 .idea/
 *.swp
+__pycache__/

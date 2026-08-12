@@ -1,3 +1,7 @@
+\if :production_enabled
+\echo 'Production mode: preserving authenticated SMTP settings.'
+\else
+
 BEGIN;
 
 INSERT INTO settings (key, value)
@@ -13,3 +17,5 @@ VALUES
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 COMMIT;
+
+\endif

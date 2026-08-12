@@ -22,9 +22,13 @@ if ! /usr/local/bin/colima status >/dev/null 2>&1; then
     --disk 120
 fi
 
-/usr/local/bin/docker compose \
-  --env-file "$stack_dir/.env" \
-  --file "$stack_dir/docker-compose.yml" \
-  up --detach --remove-orphans
+compose_args=(
+  --env-file "$stack_dir/.env"
+  --file "$stack_dir/docker-compose.yml"
+)
+if [[ -f "$stack_dir/.runtime/production-enabled" && -f "$stack_dir/.production.env" ]]; then
+  compose_args+=(--env-file "$stack_dir/.production.env" --profile production)
+fi
+/usr/local/bin/docker compose $compose_args up --detach --remove-orphans
 
 "$stack_dir/configure-tailnet-serve.zsh"

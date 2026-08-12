@@ -5,6 +5,7 @@ mail_domain="${1:-${MAIL_DOMAIN:-}}"
 dkim_selector="${2:-${DKIM_SELECTOR:-}}"
 relay_host="${3:-${RELAY_HOST:-smtp-relay.brevo.com}}"
 docker_bin="${DOCKER_BIN:-/usr/local/bin/docker}"
+stack_dir="${0:A:h}"
 
 typeset -i pass_count=0 warn_count=0 block_count=0
 pass() { (( pass_count += 1 )); print -- "PASS  $1"; }
@@ -40,6 +41,23 @@ else
   block "authenticated relay is unreachable on TCP/587 ($relay_host)"
 fi
 
+if [[ -n "${CONSENT_LEDGER:-}" ]] && [[ -s "$CONSENT_LEDGER" ]] && \
+  /usr/bin/awk -F, 'NR == 1 {for (i=1;i<=NF;i++) h[$i]=1} END {exit !(NR > 1 && h["email"] && h["consent_source"] && h["consent_at"] && h["permission"])}' "$CONSENT_LEDGER"; then
+  pass "consent ledger is present and has at least one recipient"
+else
+  block "a validated consent ledger is missing or empty"
+fi
+
+if [[ -n "${BREVO_API_KEY_FILE:-}" && -n "${BREVO_SMTP_KEY_FILE:-}" && -n "${LISTMONK_BOUNCE_TOKEN_FILE:-}" && -n "${PUBLIC_HOST:-}" ]]; then
+  if /usr/bin/python3 "$stack_dir/production_preflight.py"; then
+    pass "provider credentials, feedback API and public HTTPS route are valid"
+  else
+    block "one or more provider/public-route checks failed"
+  fi
+else
+  block "production credential files and PUBLIC_HOST are not configured"
+fi
+
 if [[ -z "$mail_domain" ]]; then
   block "sending subdomain is not provided"
 else
@@ -51,13 +69,6 @@ else
     block "$mail_domain DKIM selector is missing or unresolved"
   fi
 fi
-
-[[ "${MAIL_RELAY_READY:-0}" == 1 ]] && pass "relay credentials were verified" || block "relay credentials are not verified"
-[[ "${DOMAIN_AUTH_READY:-0}" == 1 ]] && pass "provider reports domain authentication complete" || block "provider domain authentication is not confirmed"
-[[ "${UNSUBSCRIBE_READY:-0}" == 1 ]] && pass "one-click and visible unsubscribe are confirmed" || block "unsubscribe controls are not confirmed"
-[[ "${BOUNCE_READY:-0}" == 1 ]] && pass "bounce and suppression handling are confirmed" || block "bounce handling is not confirmed"
-[[ "${COMPLAINT_READY:-0}" == 1 ]] && pass "complaint monitoring is confirmed" || block "complaint monitoring is not confirmed"
-[[ "${CONSENT_READY:-0}" == 1 ]] && pass "recipient consent source is confirmed" || block "recipient consent source is not confirmed"
 
 print
 print -- "Summary: PASS=$pass_count WARN=$warn_count BLOCK=$block_count"
