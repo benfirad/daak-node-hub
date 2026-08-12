@@ -32,3 +32,5 @@ jobs:
           macos/Sources/daakLOLILEApp.swift
           -framework SwiftUI
           -framework AppKit
+      - name: Verify private mail stack
+        run: zsh tests/verify-mail.zsh

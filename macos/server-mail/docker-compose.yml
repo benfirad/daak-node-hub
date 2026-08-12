@@ -1,0 +1,201 @@
+name: mya-l11-core
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-listmonk-environment: &listmonk-environment
+  TZ: Europe/Madrid
+  LISTMONK_db__host: listmonk_db
+  LISTMONK_db__port: "5432"
+  LISTMONK_db__user: listmonk
+  LISTMONK_db__password: "${LISTMONK_DB_PASSWORD}"
+  LISTMONK_db__database: listmonk
+  LISTMONK_db__ssl_mode: disable
+
+services:
+  mailpit:
+    image: axllent/mailpit:v1.30.7
+    container_name: mailpit
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      MP_MAX_MESSAGES: "5000"
+      MP_DATABASE: /data/mailpit.db
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    volumes:
+      - mailpit_data:/data
+
+  listmonk_db:
+    image: postgres:17-alpine
+    container_name: listmonk_db
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      POSTGRES_DB: listmonk
+      POSTGRES_USER: listmonk
+      POSTGRES_PASSWORD: "${LISTMONK_DB_PASSWORD}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U listmonk -d listmonk"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - listmonk_db_data:/var/lib/postgresql/data
+
+  listmonk_init:
+    image: listmonk/listmonk:v6.2.0
+    restart: "no"
+    depends_on:
+      listmonk_db:
+        condition: service_healthy
+    command:
+      - sh
+      - -ec
+      - >-
+        ./listmonk --install --idempotent --yes --config '' &&
+        ./listmonk --upgrade --yes --config ''
+    environment:
+      <<: *listmonk-environment
+      LISTMONK_ADMIN_USER: "${LISTMONK_ADMIN_USER}"
+      LISTMONK_ADMIN_PASSWORD: "${LISTMONK_ADMIN_PASSWORD}"
+
+  listmonk_seed:
+    image: postgres:17-alpine
+    restart: "no"
+    depends_on:
+      listmonk_init:
+        condition: service_completed_successfully
+    environment:
+      PGPASSWORD: "${LISTMONK_DB_PASSWORD}"
+    command:
+      - psql
+      - --host=listmonk_db
+      - --username=listmonk
+      - --dbname=listmonk
+      - --set=ON_ERROR_STOP=1
+      - --set=production_enabled=${MAIL_PRODUCTION_ENABLED:-0}
+      - --file=/config/listmonk-safe-settings.sql
+    volumes:
+      - ./listmonk-safe-settings.sql:/config/listmonk-safe-settings.sql:ro
+
+  listmonk:
+    image: listmonk/listmonk:v6.2.0
+    container_name: listmonk
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      listmonk_seed:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
+    command: ["./listmonk", "--config", ""]
+    environment:
+      <<: *listmonk-environment
+      LISTMONK_app__address: "0.0.0.0:9000"
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16.17
+    container_name: stalwart
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      TZ: Europe/Madrid
+      STALWART_PUBLIC_URL: "http://100.106.212.28:8080"
+      STALWART_RECOVERY_ADMIN: "${STALWART_RECOVERY_ADMIN}"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1587:587"
+      - "127.0.0.1:1993:993"
+    volumes:
+      - stalwart_etc:/etc/stalwart
+      - stalwart_data:/var/lib/stalwart
+
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+  public_gateway:
+    image: nginx:1.29.1-alpine
+    container_name: mail-public-gateway
+    restart: unless-stopped
+    profiles: ["production"]
+    logging: *default-logging
+    depends_on:
+      - listmonk
+    volumes:
+      - ./public-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8088/healthz | grep -qx ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.2
+    container_name: mail-cloudflared
+    restart: unless-stopped
+    profiles: ["production"]
+    logging: *default-logging
+    depends_on:
+      public_gateway:
+        condition: service_healthy
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token-file
+      - /run/secrets/cloudflare-tunnel-token
+    volumes:
+      - ${CLOUDFLARE_TUNNEL_TOKEN_FILE:-./.runtime/cloudflare-tunnel-token}:/run/secrets/cloudflare-tunnel-token:ro
+
+  brevo_feedback:
+    image: python:3.13.7-alpine
+    container_name: mail-brevo-feedback
+    restart: unless-stopped
+    profiles: ["production"]
+    logging: *default-logging
+    depends_on:
+      - listmonk
+    environment:
+      BREVO_API_KEY_FILE: /run/secrets/brevo-api-key
+      LISTMONK_API_USER: ${LISTMONK_BOUNCE_USER:-brevo-bounce}
+      LISTMONK_API_TOKEN_FILE: /run/secrets/listmonk-bounce-token
+      LISTMONK_URL: http://listmonk:9000
+      POLL_SECONDS: "300"
+      STATE_FILE: /state/feedback-state.json
+      HEARTBEAT_FILE: /state/heartbeat
+    command: ["python3", "/app/brevo_feedback_sync.py", "run"]
+    volumes:
+      - ./brevo_feedback_sync.py:/app/brevo_feedback_sync.py:ro
+      - ${BREVO_API_KEY_FILE:-./.runtime/brevo-api-key}:/run/secrets/brevo-api-key:ro
+      - ${LISTMONK_BOUNCE_TOKEN_FILE:-./.runtime/listmonk-bounce-token}:/run/secrets/listmonk-bounce-token:ro
+      - brevo_feedback_state:/state
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /state/heartbeat && find /state/heartbeat -mmin -15 | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  listmonk_db_data:
+  mailpit_data:
+  stalwart_etc:
+  stalwart_data:
+  portainer_data:
+  brevo_feedback_state:
