@@ -7,6 +7,13 @@
   "mailPreviewURL": "http://100.64.0.10:8025",
   "containerPanelURL": "https://100.64.0.10:9443",
   "dnsPanelURL": "http://100.64.0.11:3001",
+  "brevoSMTPURL": "https://app.brevo.com/settings/keys/smtp",
+  "brevoDomainsURL": "https://app.brevo.com/senders/domain/list",
+  "brevoSMTPHost": "smtp-relay.brevo.com",
+  "brevoSMTPPort": 587,
+  "brevoSMTPLogin": "account-id@smtp-brevo.com (optional display-only value)",
+  "inboundProvider": "Current public MX provider (display-only status)",
+  "inboundMX": "mx1.example.com / mx2.example.com (display-only status)",
   "wakeMAC": "00:11:22:33:44:55",
   "wakeBroadcasts": ["255.255.255.255", "192.168.1.255"]
 }
