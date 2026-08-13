@@ -714,15 +714,14 @@ private final class MYAL11Monitor: ObservableObject {
 
     private let statusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/status.json"
     private let fastDropStatusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/fastdrop-status.json"
-    private let syncPath = NSHomeDirectory() + "/Library/Application Support/DAAK/daak-node-sync.zsh"
     private let routeSelectorPath = NSHomeDirectory() + "/Library/Application Support/DAAK/mya-direct.zsh"
     private let configuration = NodeConfiguration.load()
     private var timer: Timer?
     private var lastUPSState: String?
 
     init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+        timer = Self.makeCoalescedTimer(interval: 60, tolerance: 12) { [weak self] in
+            await self?.refresh()
         }
         Task { await refresh() }
     }
@@ -759,7 +758,6 @@ private final class MYAL11Monitor: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
 
-        _ = await LocalCommand.run("/bin/zsh", [syncPath])
         await refreshRoute()
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: statusPath))
@@ -780,6 +778,19 @@ private final class MYAL11Monitor: ObservableObject {
             fastDrop = nil
             lastError = "MYA-L11 telemetrisi okunamadı."
         }
+    }
+
+    private static func makeCoalescedTimer(
+        interval: TimeInterval,
+        tolerance: TimeInterval,
+        action: @escaping @MainActor () async -> Void
+    ) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in await action() }
+        }
+        timer.tolerance = tolerance
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
     }
 
     var fastDropOnline: Bool {
@@ -968,9 +979,11 @@ private final class NodeMonitor: ObservableObject {
 
     init() {
         host = UserDefaults.standard.string(forKey: hostKey) ?? ""
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer(timeInterval: 90, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
+        timer?.tolerance = 18
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
         Task { await refresh() }
     }
 
@@ -1022,6 +1035,10 @@ private final class NodeMonitor: ObservableObject {
     }
 
     func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
         await refreshCachedLocation()
         await refreshExitNodeState()
         guard Self.isSafeHost(host) else {
@@ -1030,8 +1047,6 @@ private final class NodeMonitor: ObservableObject {
             return
         }
 
-        isRefreshing = true
-        defer { isRefreshing = false }
         let result = await LocalCommand.run("/usr/bin/ssh", sshArguments(remoteCommand: ".local/bin/daak-find status"))
         guard result.exitCode == 0,
               let data = result.output.data(using: .utf8),
@@ -1382,11 +1397,13 @@ private final class RelayMonitor: ObservableObject {
         host = UserDefaults.standard.string(forKey: hostKey)
             ?? UserDefaults.standard.string(forKey: legacyHostKey)
             ?? ""
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.refresh()
             }
         }
+        timer?.tolerance = 12
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
         Task { await refresh() }
     }
 
@@ -1425,6 +1442,7 @@ private final class RelayMonitor: ObservableObject {
     }
 
     func refresh() async {
+        guard !isRefreshing else { return }
         guard let baseURL else {
             lastError = host.isEmpty ? "Önce Windows PC’nin Tailscale IP’sini yaz." : "IP adresi geçerli değil."
             return
@@ -1632,17 +1650,24 @@ private struct MetricRow: View {
 private final class LocalMacMonitor: ObservableObject {
     @Published private(set) var health: LocalMacHealth?
     private var timer: Timer?
+    private var isRefreshing = false
 
     init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
+        timer?.tolerance = 12
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
         Task { await refresh() }
     }
 
     deinit { timer?.invalidate() }
 
     func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
         let script = #"""
         batt=$(/usr/bin/pmset -g batt)
         level=$(printf '%s\n' "$batt" | awk 'NR==2 {for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/[^0-9]/,"",$i); print $i; exit}}')
@@ -1881,7 +1906,7 @@ private struct DeviceOverviewView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("15 sn canlı")
+                Text("60 sn ekonomik canlı")
                     .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
             }
 
