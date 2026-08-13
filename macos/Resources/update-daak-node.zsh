@@ -25,7 +25,28 @@ if [[ -r "$app/Contents/Info.plist" ]]; then
   current="$(/usr/libexec/PlistBuddy -c 'Print :DAAKSourceCommit' "$app/Contents/Info.plist" 2>/dev/null || printf unknown)"
 fi
 
-latest="$(/usr/bin/git ls-remote "$repository" "refs/heads/$branch" 2>>"$log_file" | /usr/bin/awk 'NR == 1 { print $1 }')"
+latest="$(/usr/bin/python3 - "$repository" "$branch" "$log_file" <<'PY'
+import subprocess, sys
+
+try:
+    result = subprocess.run(
+        ["/usr/bin/git", "ls-remote", sys.argv[1], f"refs/heads/{sys.argv[2]}"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+except subprocess.TimeoutExpired:
+    with open(sys.argv[3], "a", encoding="utf-8") as log:
+        log.write("GitHub version check timed out after 20 seconds.\n")
+    raise SystemExit(0)
+
+if result.stderr:
+    with open(sys.argv[3], "a", encoding="utf-8") as log:
+        log.write(result.stderr)
+if result.returncode == 0 and result.stdout:
+    print(result.stdout.split()[0])
+PY
+)"
 if ! printf '%s' "$latest" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'; then
   json_result error "$current" unknown 'GitHub sürüm bilgisi alınamadı.'
   exit 2
