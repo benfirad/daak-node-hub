@@ -288,6 +288,22 @@ private struct MYAL11Status: Decodable {
     let services: Services
 }
 
+private struct FastDropStatus: Decodable {
+    let updatedAt: TimeInterval
+    let state: String
+    let mounted: Bool
+    let capacityBytes: Int64
+    let usedBytes: Int64
+    let availableBytes: Int64
+    let incomingFiles: Int
+    let incomingBytes: Int64
+    let retainedFiles: Int
+    let retainedBytes: Int64
+    let currentFile: String?
+    let lastSuccessAt: TimeInterval?
+    let lastError: String?
+}
+
 private struct TailnetStatus: Decodable {
     struct ExitNodeStatus: Decodable {
         let tailscaleIPs: [String]?
@@ -673,6 +689,7 @@ private final class MYAL11Monitor: ObservableObject {
     }
 
     @Published private(set) var status: MYAL11Status?
+    @Published private(set) var fastDrop: FastDropStatus?
     @Published private(set) var route: Route = .offline
     @Published private(set) var lastError: String?
     @Published private(set) var actionMessage: String?
@@ -680,6 +697,7 @@ private final class MYAL11Monitor: ObservableObject {
     @Published private(set) var isRunningAction = false
 
     private let statusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/status.json"
+    private let fastDropStatusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/fastdrop-status.json"
     private let syncPath = NSHomeDirectory() + "/Library/Application Support/DAAK/daak-node-sync.zsh"
     private let routeSelectorPath = NSHomeDirectory() + "/Library/Application Support/DAAK/mya-direct.zsh"
     private let configuration = NodeConfiguration.load()
@@ -733,12 +751,35 @@ private final class MYAL11Monitor: ObservableObject {
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let decoded = try decoder.decode(MYAL11Status.self, from: data)
             status = decoded
+            if let fastDropData = try? Data(contentsOf: URL(fileURLWithPath: fastDropStatusPath)),
+               let decodedFastDrop = try? decoder.decode(FastDropStatus.self, from: fastDropData) {
+                fastDrop = decodedFastDrop
+            } else {
+                fastDrop = nil
+            }
             evaluateUPSNotification(decoded)
             lastError = isFresh ? nil : "Son telemetri güncel değil."
         } catch {
             status = nil
+            fastDrop = nil
             lastError = "MYA-L11 telemetrisi okunamadı."
         }
+    }
+
+    var fastDropOnline: Bool {
+        guard let fastDrop else { return false }
+        return fastDrop.mounted && abs(Date().timeIntervalSince1970 - fastDrop.updatedAt) < 180
+    }
+
+    var fastDropSummary: String {
+        guard let fastDrop else { return "Durum bekleniyor" }
+        if let error = fastDrop.lastError, !error.isEmpty { return "Hata · \(error)" }
+        if fastDrop.state == "uploading", let file = fastDrop.currentFile {
+            return "Aktarılıyor · \(file)"
+        }
+        let available = ByteCountFormatter.string(fromByteCount: fastDrop.availableBytes, countStyle: .file)
+        if fastDrop.incomingFiles > 0 { return "\(fastDrop.incomingFiles) dosya sırada · \(available) boş" }
+        return "Hazır · \(available) boş · \(fastDrop.retainedFiles) dosya 72 saat korunuyor"
     }
 
     private func refreshRoute() async {
@@ -1867,6 +1908,7 @@ private struct ServerServicesView: View {
 
                 Group {
                     Text("Linux altyapısı").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ServiceShortcut(title: "FastDrop", detail: monitor.fastDropSummary, symbol: "arrow.left.arrow.right.circle.fill", tint: .blue, available: monitor.fastDropOnline, action: monitor.openDisk)
                     ServiceShortcut(title: "Konteyner paneli", detail: "Portainer · servisleri gör ve yönet", symbol: "shippingbox.and.arrow.backward.fill", tint: .teal, available: monitor.isOnline, action: monitor.openContainerPanel)
                     ServiceShortcut(title: "DNS ve reklam engelleme", detail: "AdGuard Home", symbol: "shield.lefthalf.filled", tint: .green, available: monitor.isOnline && (monitor.status?.services.adblock ?? true), action: monitor.openDNSPanel)
                     ServiceShortcut(title: "Sunucu ekranı", detail: "Tek tuş Apple Ekran Paylaşımı", symbol: "rectangle.on.rectangle", tint: .cyan, available: monitor.isOnline, action: monitor.openScreen)
@@ -1950,6 +1992,7 @@ private struct MYAL11MenuView: View {
                     MetricRow(title: "Boş RAM", value: "%\(status.memoryFreePercent)")
                     MetricRow(title: "Boş disk", value: Self.formatKB(status.diskFreeKB))
                     MetricRow(title: "Docker", value: "\(status.dockerContainersRunning) konteyner")
+                    MetricRow(title: "FastDrop", value: monitor.fastDropSummary)
                     MetricRow(title: "Stats", value: status.services.stats == true ? "Çalışıyor" : "Kontrol gerekli")
                     MetricRow(title: "SSH / Ekran", value: status.services.ssh && status.services.screenSharing ? "Açık / Açık" : "Kontrol gerekli")
                     MetricRow(title: "Uyanık tutma", value: status.services.caffeinateGuard ? "Aktif" : "Kontrol gerekli")
