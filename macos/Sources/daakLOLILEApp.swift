@@ -245,6 +245,22 @@ private struct NodeLocation: Decodable, Equatable {
     let capturedAt: TimeInterval
 }
 
+private struct NodeDeviceHealth: Decodable, Sendable {
+    let batteryPercent: Int?
+    let batteryTemperatureC: Double?
+    let cpuTemperatureC: Double?
+    let memoryFreePercent: Int?
+    let powerLabel: String?
+}
+
+private struct LocalMacHealth: Decodable, Sendable {
+    let batteryPercent: Int?
+    let batteryTemperatureC: Double?
+    let cpuTemperatureC: Double?
+    let memoryFreePercent: Int?
+    let powerLabel: String
+}
+
 private struct MYAL11Status: Decodable {
     struct Services: Decodable {
         let tailscale: Bool
@@ -941,6 +957,7 @@ private final class NodeMonitor: ObservableObject {
     @Published private(set) var isSettingExitNode = false
     @Published private(set) var isPhoneExitNodeAvailable = false
     @Published private(set) var isUsingPhoneExitNode = false
+    @Published private(set) var deviceHealth: NodeDeviceHealth?
     @Published var host: String
 
     private let hostKey = "daakNodeHost"
@@ -987,6 +1004,15 @@ private final class NodeMonitor: ObservableObject {
         return formatter.localizedString(for: Date(timeIntervalSince1970: timestamp), relativeTo: Date())
     }
 
+    var healthSummary: String {
+        guard isOnline else { return "Bağlantı bekleniyor" }
+        var parts: [String] = []
+        if let value = deviceHealth?.batteryPercent { parts.append("Pil %\(value)") }
+        if let value = deviceHealth?.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", value)) }
+        if let value = deviceHealth?.batteryTemperatureC { parts.append(String(format: "Pil %.0f°C", value)) }
+        return parts.isEmpty ? stateLabel : parts.joined(separator: " · ")
+    }
+
     func saveAndRefresh() async {
         host = Self.cleanedHost(host)
         UserDefaults.standard.set(host, forKey: hostKey)
@@ -1015,7 +1041,53 @@ private final class NodeMonitor: ObservableObject {
             return
         }
         status = decoded
+        await refreshDeviceHealth()
         lastError = nil
+    }
+
+    private func refreshDeviceHealth() async {
+        guard Self.isSafeHost(host) else { return }
+        let serial = "\(host):\(adbPort)"
+        let connected = await LocalCommand.run("/opt/homebrew/bin/adb", ["connect", serial])
+        guard connected.exitCode == 0 else { return }
+        async let batteryResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "dumpsys", "battery"])
+        async let thermalResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "dumpsys", "thermalservice"])
+        async let memoryResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "cat", "/proc/meminfo"])
+        let (battery, thermal, memory) = await (batteryResult, thermalResult, memoryResult)
+        guard battery.exitCode == 0 else { return }
+        let level = Self.firstNumber(in: battery.output, pattern: #"(?m)^\s*level:\s*(\d+)\s*$"#).map { Int($0) }
+        let rawBatteryTemperature = Self.firstNumber(in: battery.output, pattern: #"(?m)^\s*temperature:\s*(\d+)\s*$"#)
+        let batteryTemperature = rawBatteryTemperature.map { $0 / 10 }
+        let cpuTemperature = Self.allNumbers(
+            in: thermal.output,
+            pattern: #"mValue=([-0-9.]+),\s*mType=1,"#
+        ).last(where: { $0 > 0 })
+        let total = Self.firstNumber(in: memory.output, pattern: #"(?m)^MemTotal:\s*(\d+)"#)
+        let available = Self.firstNumber(in: memory.output, pattern: #"(?m)^MemAvailable:\s*(\d+)"#)
+        let memoryFree = total.flatMap { total in available.map { Int(($0 * 100 / total).rounded()) } }
+        let power = battery.output.contains("AC powered: true") ? "AC" :
+            (battery.output.contains("USB powered: true") ? "USB" : "UNPLUGGED")
+        deviceHealth = NodeDeviceHealth(
+            batteryPercent: level,
+            batteryTemperatureC: batteryTemperature,
+            cpuTemperatureC: cpuTemperature,
+            memoryFreePercent: memoryFree,
+            powerLabel: power
+        )
+    }
+
+    private static func firstNumber(in value: String, pattern: String) -> Double? {
+        allNumbers(in: value, pattern: pattern).first
+    }
+
+    private static func allNumbers(in value: String, pattern: String) -> [Double] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(value.startIndex..., in: value)
+        return expression.matches(in: value, range: range).compactMap { match in
+            guard match.numberOfRanges > 1,
+                  let numberRange = Range(match.range(at: 1), in: value) else { return nil }
+            return Double(value[numberRange])
+        }
     }
 
     func setPhoneExitNode(enabled: Bool) async {
@@ -1556,10 +1628,55 @@ private struct MetricRow: View {
     }
 }
 
+@MainActor
+private final class LocalMacMonitor: ObservableObject {
+    @Published private(set) var health: LocalMacHealth?
+    private var timer: Timer?
+
+    init() {
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
+        }
+        Task { await refresh() }
+    }
+
+    deinit { timer?.invalidate() }
+
+    func refresh() async {
+        let script = #"""
+        batt=$(/usr/bin/pmset -g batt)
+        level=$(printf '%s\n' "$batt" | awk 'NR==2 {for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/[^0-9]/,"",$i); print $i; exit}}')
+        power=$(printf '%s\n' "$batt" | head -1 | sed "s/Now drawing from '//; s/'$//")
+        mem=$(/usr/bin/memory_pressure 2>/dev/null | awk -F': ' '/System-wide memory free percentage/ {gsub(/%/,"",$2); print $2; exit}')
+        smc='/Applications/Stats.app/Contents/Resources/smc'
+        cpu=null
+        btemp=null
+        if [[ -x "$smc" ]]; then
+          temps=$("$smc" list -t 2>/dev/null)
+          cpu=$(printf '%s\n' "$temps" | awk '$1=="[TCHP]" {print $2; exit}')
+          btemp=$(printf '%s\n' "$temps" | awk '$1=="[TB0T]" {print $2; exit}')
+        fi
+        printf '{"batteryPercent":%s,"batteryTemperatureC":%s,"cpuTemperatureC":%s,"memoryFreePercent":%s,"powerLabel":"%s"}\n' "${level:-null}" "${btemp:-null}" "${cpu:-null}" "${mem:-null}" "$power"
+        """#
+        let result = await LocalCommand.run("/bin/zsh", ["-c", script])
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(LocalMacHealth.self, from: data) else { return }
+        health = decoded
+    }
+
+    var summary: String {
+        guard let health else { return "Yerel telemetri bekleniyor" }
+        var parts = [health.powerLabel]
+        if let value = health.batteryPercent { parts.append("Pil %\(value)") }
+        if let value = health.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", value)) }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private enum DevicePanel: String, CaseIterable, Identifiable {
     case devices
-    case services
-    case mail
+    case operations
     case lolile
     case myaL11
     case node
@@ -1568,9 +1685,8 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .devices: return "Cihazlar"
-        case .services: return "Servisler"
-        case .mail: return "Mail"
+        case .devices: return "Merkez"
+        case .operations: return "Servisler"
         case .lolile: return "LOLİLE"
         case .myaL11: return "MYA-L11"
         case .node: return "S9+"
@@ -1753,20 +1869,59 @@ private struct DeviceOverviewView: View {
     @EnvironmentObject private var relay: RelayMonitor
     @EnvironmentObject private var node: NodeMonitor
     @EnvironmentObject private var myaL11: MYAL11Monitor
+    @EnvironmentObject private var localMac: LocalMacMonitor
     @Binding var selection: DevicePanel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Tüm cihazların tek güvenli merkezde")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SUNUCU DURUMU").font(.caption.weight(.bold))
+                    Text("Güç, sıcaklık ve erişim tek bakışta")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("15 sn canlı")
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+
+            if let status = myaL11.status {
+                HStack(spacing: 10) {
+                    Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "battery.100percent.bolt")
+                        .font(.title3)
+                        .foregroundStyle(myaL11.isOnBattery ? Color.orange : Color.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(myaL11.isOnBattery ? "UPS DEVREDE" : "UPS HAZIR")
+                            .font(.callout.weight(.bold))
+                        Text(myaL11.upsSummary)
+                            .font(.caption2)
+                            .foregroundStyle(myaL11.isOnBattery ? Color.orange : Color.secondary)
+                    }
+                    Spacer()
+                    if myaL11.isOnBattery, let minutes = status.batteryMinutesRemaining, minutes >= 0 {
+                        Text("≈ \(minutes) dk")
+                            .font(.headline.monospacedDigit())
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("%\(status.batteryPercent)")
+                            .font(.headline.monospacedDigit())
+                    }
+                }
+                .padding(12)
+                .background(
+                    (myaL11.isOnBattery ? Color.orange : Color.green).opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 13)
+                )
+            }
 
             DeviceCard(
                 name: "LOLİLE",
                 detail: "Windows · Relay · Uzaktan kontrol",
                 symbol: "desktopcomputer",
                 online: relay.isConnected,
-                status: relay.isConnected ? "Tailscale üzerinden bağlı" : "Bağlantı bekleniyor",
+                status: relay.status?.hardware?.available == true
+                    ? "CPU \(RelayMonitor.formatTemperature(relay.status?.hardware?.cpu?.temperatureC)) · GPU \(RelayMonitor.formatTemperature(relay.status?.hardware?.gpu?.temperatureC)) · \(relay.menuTitle)"
+                    : (relay.isConnected ? "Tailscale üzerinden bağlı" : "Bağlantı bekleniyor"),
                 actionTitle: "Ekranı aç",
                 action: relay.openRemoteDesktop,
                 openDetails: { selection = .lolile }
@@ -1788,7 +1943,7 @@ private struct DeviceOverviewView: View {
                 detail: "Galaxy S9+ · Find · SSH · Canlı ekran",
                 symbol: "iphone",
                 online: node.isOnline,
-                status: node.stateLabel,
+                status: node.healthSummary,
                 actionTitle: "Ekranı aç",
                 action: { Task { await node.openLiveScreen() } },
                 openDetails: { selection = .node }
@@ -1797,19 +1952,19 @@ private struct DeviceOverviewView: View {
             HStack(spacing: 10) {
                 Image(systemName: "laptopcomputer")
                     .foregroundStyle(.green)
+                    .frame(width: 26)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("BU MAC")
-                        .font(.caption.weight(.semibold))
-                    Text("DAAK cihaz kontrol merkezi")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    Text("BU MAC").font(.caption.weight(.semibold))
+                    Text(localMac.summary).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("Yerel")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
+                if let temp = localMac.health?.batteryTemperatureC {
+                    Text(String(format: "Pil %.0f°C", temp))
+                        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                }
             }
-            .padding(.horizontal, 4)
+            .padding(10)
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 11))
 
             Divider()
 
@@ -1929,6 +2084,31 @@ private struct ServerServicesView: View {
     }
 }
 
+private struct OperationsView: View {
+    @State private var section = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Servis grubu", selection: $section) {
+                Text("Altyapı").tag(0)
+                Text("Mail").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+
+            Divider().padding(.top, 10)
+
+            if section == 0 {
+                ServerServicesView()
+            } else {
+                MailAccountsView()
+            }
+        }
+    }
+}
+
 private struct MYAL11MenuView: View {
     @EnvironmentObject private var monitor: MYAL11Monitor
     @State private var confirmsShutdown = false
@@ -1994,7 +2174,8 @@ private struct MYAL11MenuView: View {
                     MetricRow(title: "Docker", value: "\(status.dockerContainersRunning) konteyner")
                     MetricRow(title: "FastDrop", value: monitor.fastDropSummary)
                     MetricRow(title: "Stats", value: status.services.stats == true ? "Çalışıyor" : "Kontrol gerekli")
-                    MetricRow(title: "SSH / Ekran", value: status.services.ssh && status.services.screenSharing ? "Açık / Açık" : "Kontrol gerekli")
+                    MetricRow(title: "SSH", value: status.services.ssh ? "Bağlanılabilir" : "Kontrol gerekli")
+                    MetricRow(title: "Ekran", value: status.services.screenSharing ? "Bağlanılabilir" : "Kontrol gerekli")
                     MetricRow(title: "Uyanık tutma", value: status.services.caffeinateGuard ? "Aktif" : "Kontrol gerekli")
                 }
             } else {
@@ -2151,6 +2332,16 @@ private struct NodeMenuView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 12))
 
+            if let health = node.deviceHealth {
+                VStack(spacing: 9) {
+                    MetricRow(title: "Pil", value: health.batteryPercent.map { "%\($0) · \(health.powerLabel ?? "bilinmiyor")" } ?? "Sensör bekleniyor")
+                    MetricRow(title: "CPU sıcaklığı", value: health.cpuTemperatureC.map { String(format: "%.0f°C", $0) } ?? "Sensör okunamadı")
+                    MetricRow(title: "Pil sıcaklığı", value: health.batteryTemperatureC.map { String(format: "%.0f°C", $0) } ?? "Sensör okunamadı")
+                    MetricRow(title: "Boş RAM", value: health.memoryFreePercent.map { "%\($0)" } ?? "Telemetri bekleniyor")
+                    MetricRow(title: "Canlı ekran", value: node.isOnline ? "ADB · bağlanılabilir" : "Bağlantı bekleniyor")
+                }
+            }
+
             HStack(spacing: 8) {
                 Button {
                     Task { await node.openFind() }
@@ -2259,6 +2450,7 @@ private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var separation: SeparationMonitor
     @EnvironmentObject private var mail: MailAccountMonitor
     @EnvironmentObject private var updater: UpdateMonitor
+    @EnvironmentObject private var localMac: LocalMacMonitor
     @State private var selection: DevicePanel = .devices
 
     var body: some View {
@@ -2297,10 +2489,8 @@ private struct DAAKDevicesMenuView: View {
             switch selection {
             case .devices:
                 DeviceOverviewView(selection: $selection)
-            case .services:
-                ServerServicesView()
-            case .mail:
-                MailAccountsView()
+            case .operations:
+                OperationsView()
             case .lolile:
                 ScrollView {
                     RelayMenuView()
@@ -2339,7 +2529,7 @@ private struct DAAKDevicesMenuView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 9)
         }
-        .frame(width: 420)
+        .frame(width: 460)
         .onReceive(node.$location) { location in
             separation.updatePhoneLocation(location)
         }
@@ -2687,6 +2877,7 @@ struct daakLOLILEApp: App {
     @StateObject private var separation = SeparationMonitor()
     @StateObject private var mail = MailAccountMonitor()
     @StateObject private var updater = UpdateMonitor()
+    @StateObject private var localMac = LocalMacMonitor()
 
     var body: some Scene {
         MenuBarExtra {
@@ -2697,6 +2888,7 @@ struct daakLOLILEApp: App {
                 .environmentObject(separation)
                 .environmentObject(mail)
                 .environmentObject(updater)
+                .environmentObject(localMac)
         } label: {
             Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "circle.grid.2x2.fill")
                 .symbolRenderingMode(.hierarchical)

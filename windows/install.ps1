@@ -89,7 +89,7 @@ New-Item -ItemType Directory -Path $installRoot,$dashboardRoot,$publicRoot,$libr
 $legacyTasks = @(
     'RelayWatch Hardware Monitor','RelayWatch Dashboard','RelayWatch Power Manager',
     'LOLILE Hardware Monitor','LOLILE Dashboard','LOLILE Power Manager',
-    'LOLILE Memory Maintenance'
+    'LOLILE Memory Maintenance','daakLOLILE RAM Monitor','lolile - Hardware Monitor'
 )
 foreach ($taskName in @($hardwareTask,$dashboardTask,$powerTask,$memoryTask,$volunteerTask,$boincHeadlessTask,$ripeAtlasTask,$postRebootTask) + $legacyTasks) {
     Stop-RelayWatchTask -Name $taskName
