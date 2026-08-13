@@ -321,6 +321,13 @@ private struct CommandResult: Sendable {
     let output: String
 }
 
+private struct UpdateCommandResult: Decodable {
+    let status: String
+    let current: String
+    let latest: String
+    let message: String
+}
+
 private struct NodeConfiguration: Decodable {
     let directHost: String?
     let tailHost: String?
@@ -432,6 +439,95 @@ private enum LocalCommand {
                 return CommandResult(exitCode: 127, output: error.localizedDescription)
             }
         }.value
+    }
+}
+
+@MainActor
+private final class UpdateMonitor: ObservableObject {
+    @Published private(set) var state = "Hazır"
+    @Published private(set) var message = "Güncellemeler main kanalından otomatik denetlenir."
+    @Published private(set) var isWorking = false
+    @Published private(set) var updateAvailable = false
+
+    private let interval: TimeInterval = 6 * 60 * 60
+    private let lastCheckKey = "DAAKNodeLastUpdateCheck"
+
+    var versionLabel: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let commit = Bundle.main.object(forInfoDictionaryKey: "DAAKSourceCommit") as? String ?? "development"
+        return "v\(version) • \(String(commit.prefix(7)))"
+    }
+
+    init() {
+        Task { await checkIfDue() }
+        Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval))
+                await checkAndInstallIfNeeded()
+            }
+        }
+    }
+
+    func checkNow() async {
+        await runUpdater(mode: "--check", installWhenAvailable: false)
+    }
+
+    func installNow() async {
+        await runUpdater(mode: "--install", installWhenAvailable: false)
+    }
+
+    private func checkIfDue() async {
+        let lastCheck = UserDefaults.standard.double(forKey: lastCheckKey)
+        guard Date().timeIntervalSince1970 - lastCheck >= interval else { return }
+        await checkAndInstallIfNeeded()
+    }
+
+    private func checkAndInstallIfNeeded() async {
+        await runUpdater(mode: "--check", installWhenAvailable: true)
+    }
+
+    private func runUpdater(mode: String, installWhenAvailable: Bool) async {
+        guard !isWorking else { return }
+        guard let script = Bundle.main.url(forResource: "update-daak-node", withExtension: "zsh")?.path else {
+            state = "Updater eksik"
+            message = "Bu sürüm güncelleme aracını içermiyor."
+            return
+        }
+
+        isWorking = true
+        state = mode == "--install" ? "Güncelleniyor" : "Denetleniyor"
+
+        let command = await LocalCommand.run("/bin/zsh", [script, mode])
+        guard let line = command.output.split(separator: "\n").last,
+              let data = String(line).data(using: .utf8),
+              let result = try? JSONDecoder().decode(UpdateCommandResult.self, from: data) else {
+            state = "Hata"
+            message = command.output.isEmpty ? "Güncelleme aracı yanıt vermedi." : command.output
+            isWorking = false
+            return
+        }
+
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+        message = result.message
+        updateAvailable = result.status == "available"
+        switch result.status {
+        case "current": state = "Güncel"
+        case "available": state = "Güncelleme hazır"
+        case "installed":
+            state = "Kuruldu"
+            updateAvailable = false
+            Task {
+                try? await Task.sleep(for: .milliseconds(500))
+                NSApplication.shared.terminate(nil)
+            }
+        case "busy": state = "Güncelleniyor"
+        default: state = "Hata"
+        }
+
+        isWorking = false
+        if installWhenAvailable && result.status == "available" {
+            await runUpdater(mode: "--install", installWhenAvailable: false)
+        }
     }
 }
 
@@ -2091,6 +2187,7 @@ private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var myaL11: MYAL11Monitor
     @EnvironmentObject private var separation: SeparationMonitor
     @EnvironmentObject private var mail: MailAccountMonitor
+    @EnvironmentObject private var updater: UpdateMonitor
     @State private var selection: DevicePanel = .devices
 
     var body: some View {
@@ -2143,6 +2240,33 @@ private struct DAAKDevicesMenuView: View {
             case .node:
                 NodeMenuView()
             }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("DAAK NODE \(updater.versionLabel)")
+                        .font(.caption2.monospacedDigit())
+                    Text(updater.message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if updater.isWorking {
+                    ProgressView().controlSize(.small)
+                } else if updater.updateAvailable {
+                    Button("Güncelle") { Task { await updater.installNow() } }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                } else {
+                    Button("Kontrol et") { Task { await updater.checkNow() } }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
         }
         .frame(width: 420)
         .onReceive(node.$location) { location in
@@ -2491,6 +2615,7 @@ struct daakLOLILEApp: App {
     @StateObject private var myaL11 = MYAL11Monitor()
     @StateObject private var separation = SeparationMonitor()
     @StateObject private var mail = MailAccountMonitor()
+    @StateObject private var updater = UpdateMonitor()
 
     var body: some Scene {
         MenuBarExtra {
@@ -2500,6 +2625,7 @@ struct daakLOLILEApp: App {
                 .environmentObject(myaL11)
                 .environmentObject(separation)
                 .environmentObject(mail)
+                .environmentObject(updater)
         } label: {
             Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "circle.grid.2x2.fill")
                 .symbolRenderingMode(.hierarchical)
