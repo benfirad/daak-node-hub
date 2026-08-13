@@ -933,9 +933,25 @@ private final class MYAL11Monitor: ObservableObject {
                 actionMessage = "Wake-on-LAN için node-config.json ayarı gerekli."
                 return
             }
+            let wakeScript = #"""
+            import json, socket, sys
+            mac = bytes.fromhex(sys.argv[1].replace(":", "").replace("-", ""))
+            packet = b"\xff" * 6 + mac * 16
+            sent, errors = [], []
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for host in json.loads(sys.argv[2]):
+                try:
+                    sock.sendto(packet, (host, 9))
+                    sent.append(host)
+                except OSError as error:
+                    errors.append(f"{host}: {error}")
+            print(json.dumps({"sent": sent, "errors": errors}))
+            raise SystemExit(0 if sent else 1)
+            """#
             let result = await LocalCommand.run(
                 "/usr/bin/python3",
-                ["-c", "import json,socket,sys; m=bytes.fromhex(sys.argv[1].replace(':','').replace('-','')); p=b'\\xff'*6+m*16; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1); [s.sendto(p,(h,9)) for h in json.loads(sys.argv[2])]", mac, broadcastJSON]
+                ["-c", wakeScript, mac, broadcastJSON]
             )
             actionMessage = result.exitCode == 0 ? "Uyandırma paketi yerel ağa gönderildi." : "Uyandırma paketi gönderilemedi."
             return

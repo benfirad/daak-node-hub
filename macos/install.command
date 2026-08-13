@@ -7,6 +7,8 @@ commit="$(/usr/bin/git -C "$repo" rev-parse HEAD)"
 build_dir="${DAAK_NODE_BUILD_DIR:-$HOME/Library/Caches/DAAKNodeHub/bootstrap}"
 app='/Applications/daakLOLILE.app'
 launch_agent="$HOME/Library/LaunchAgents/app.daaknode.system-ui.plist"
+launch_domain="gui/$(id -u)"
+launch_label='app.daaknode.system-ui'
 
 DAAK_NODE_BUILD_DIR="$build_dir" DAAK_NODE_SOURCE_COMMIT="$commit" /bin/zsh "$root/build.command"
 candidate="$build_dir/daakLOLILE.app"
@@ -16,6 +18,7 @@ staging="/Applications/.daakLOLILE.bootstrap.$$.app"
 /usr/bin/ditto "$candidate" "$staging"
 /usr/bin/codesign --verify --deep --strict "$staging"
 
+/bin/launchctl bootout "$launch_domain/$launch_label" 2>/dev/null || true
 /usr/bin/pkill -x daakLOLILE 2>/dev/null || true
 if [[ -e "$app" ]]; then
   backup_dir="$HOME/Library/Caches/DAAKNodeHub/previous"
@@ -40,8 +43,7 @@ cat > "$launch_agent" <<PLIST
 </dict></plist>
 PLIST
 /usr/bin/plutil -lint "$launch_agent"
-/bin/launchctl bootout "gui/$(id -u)/app.daaknode.system-ui" 2>/dev/null || true
-/bin/launchctl bootstrap "gui/$(id -u)" "$launch_agent"
-/bin/launchctl kickstart -k "gui/$(id -u)/app.daaknode.system-ui"
+/bin/launchctl bootstrap "$launch_domain" "$launch_agent"
+/bin/launchctl kickstart -k "$launch_domain/$launch_label"
 
 echo "DAAK NODE $commit kuruldu; sonraki güncellemeler uygulamanın içinden otomatik yapılacak."
