@@ -1,6 +1,9 @@
 import SwiftUI
 import AppKit
 import Foundation
+@preconcurrency import CoreLocation
+import UserNotifications
+import LocalAuthentication
 
 private struct RelayStatus: Decodable {
     struct Permissions: Decodable {
@@ -230,11 +233,147 @@ private struct NodeStatus: Decodable {
     let lastSuccessAt: TimeInterval
     let consecutiveFailures: Int
     let lastError: String?
+    let provider: String?
+    let accuracyMeters: Double?
+}
+
+private struct NodeLocation: Decodable, Equatable {
+    let provider: String
+    let latitude: Double
+    let longitude: Double
+    let accuracyMeters: Double
+    let capturedAt: TimeInterval
+}
+
+private struct MYAL11Status: Decodable {
+    struct Services: Decodable {
+        let tailscale: Bool
+        let ssh: Bool
+        let screenSharing: Bool
+        let stats: Bool?
+        let keepingYouAwake: Bool
+        let awaykeProcess: Bool
+        let awaykeActive: Bool
+        let caffeinateGuard: Bool
+        let daakRemember: Bool?
+        let daakRememberSync: Bool?
+        let mail: Bool?
+        let webmail: Bool?
+        let mailGateway: Bool?
+        let adblock: Bool?
+        let listmonk: Bool?
+        let diskShare: Bool?
+    }
+
+    let updatedAt: String
+    let name: String
+    let model: String
+    let tailscaleIP: String
+    let powerSource: String
+    let batteryPercent: Int
+    let batteryMinutesRemaining: Int?
+    let upsState: String?
+    let upsMessage: String?
+    let batteryCondition: String
+    let batteryCycles: Int
+    let diskFreeKB: Int64
+    let memoryFreePercent: Int
+    let loadAverage: String
+    let uptime: String
+    let dockerContainersRunning: Int
+    let cpuUsagePercent: Double?
+    let cpuTemperatureC: Double?
+    let gpuTemperatureC: Double?
+    let diskUsedPercent: Double?
+    let services: Services
+}
+
+private struct TailnetStatus: Decodable {
+    struct ExitNodeStatus: Decodable {
+        let tailscaleIPs: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case tailscaleIPs = "TailscaleIPs"
+        }
+    }
+
+    struct Peer: Decodable {
+        let tailscaleIPs: [String]?
+        let exitNodeOption: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case tailscaleIPs = "TailscaleIPs"
+            case exitNodeOption = "ExitNodeOption"
+        }
+    }
+
+    let exitNodeStatus: ExitNodeStatus?
+    let peers: [String: Peer]
+
+    enum CodingKeys: String, CodingKey {
+        case exitNodeStatus = "ExitNodeStatus"
+        case peers = "Peer"
+    }
 }
 
 private struct CommandResult: Sendable {
     let exitCode: Int32
     let output: String
+}
+
+private struct NodeConfiguration: Decodable {
+    let directHost: String?
+    let tailHost: String?
+    let webmailURL: String?
+    let mailAdminURL: String?
+    let campaignsURL: String?
+    let mailPreviewURL: String?
+    let containerPanelURL: String?
+    let dnsPanelURL: String?
+    let wakeMAC: String?
+    let wakeBroadcasts: [String]?
+
+    static func load() -> NodeConfiguration? {
+        let path = NSHomeDirectory() + "/Library/Application Support/DAAK/node-config.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        return try? JSONDecoder().decode(NodeConfiguration.self, from: data)
+    }
+}
+
+private struct MailAccountList: Decodable {
+    struct Account: Decodable, Identifiable {
+        var id: String { address }
+        let address: String
+        let displayName: String
+        let passwordStored: Bool
+        let quotaBytes: Int64
+        let usedBytes: Int64
+    }
+
+    struct Server: Decodable {
+        struct Endpoint: Decodable {
+            let host: String
+            let port: Int
+            let security: String
+            let authentication: Bool?
+        }
+
+        let imap: Endpoint
+        let smtp: Endpoint
+        let caldav: String
+        let carddav: String
+        let webmail: String
+        let accountManager: String
+        let networkRequirement: String
+    }
+
+    let accounts: [Account]
+    let server: Server
+}
+
+private struct MailCredential: Decodable {
+    let address: String
+    let password: String
 }
 
 private enum LocalCommand {
@@ -268,24 +407,384 @@ private enum LocalCommand {
         process.arguments = arguments
         try process.run()
     }
+
+    static func run(_ executable: String, _ arguments: [String], input: String) async -> CommandResult {
+        await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            let output = Pipe()
+            let stdin = Pipe()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardOutput = output
+            process.standardError = output
+            process.standardInput = stdin
+            do {
+                try process.run()
+                stdin.fileHandleForWriting.write(Data(input.utf8))
+                try? stdin.fileHandleForWriting.close()
+                process.waitUntilExit()
+                return CommandResult(
+                    exitCode: process.terminationStatus,
+                    output: String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            } catch {
+                return CommandResult(exitCode: 127, output: error.localizedDescription)
+            }
+        }.value
+    }
+}
+
+@MainActor
+private final class MailAccountMonitor: ObservableObject {
+    @Published private(set) var data: MailAccountList?
+    @Published var selectedAddress = "begum@redmono.com"
+    @Published var revealedPassword: String?
+    @Published var newPassword = ""
+    @Published private(set) var message: String?
+    @Published private(set) var isWorking = false
+
+    private let control = NSHomeDirectory() + "/Library/Application Support/DAAK/mail-account-control.zsh"
+
+    init() { Task { await refresh() } }
+
+    var selectedAccount: MailAccountList.Account? {
+        data?.accounts.first { $0.address == selectedAddress }
+    }
+
+    func refresh() async {
+        guard !isWorking else { return }
+        isWorking = true
+        defer { isWorking = false }
+        let result = await LocalCommand.run("/bin/zsh", [control, "list"])
+        guard result.exitCode == 0,
+              let payload = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(MailAccountList.self, from: payload) else {
+            message = "Mail hesapları sunucudan okunamadı."
+            return
+        }
+        data = decoded
+        if !decoded.accounts.contains(where: { $0.address == selectedAddress }),
+           let first = decoded.accounts.first { selectedAddress = first.address }
+        message = nil
+    }
+
+    func revealOrCopy(copyOnly: Bool) async {
+        guard await authenticate(reason: copyOnly ? "Mail parolasını panoya kopyalamak için doğrulayın." : "Mail parolasını göstermek için doğrulayın.") else {
+            message = "Kimlik doğrulama tamamlanmadı."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        let result = await LocalCommand.run("/bin/zsh", [control, "show", selectedAddress])
+        guard result.exitCode == 0,
+              let payload = result.output.data(using: .utf8),
+              let credential = try? JSONDecoder().decode(MailCredential.self, from: payload) else {
+            message = "Parola okunamadı."
+            return
+        }
+        if copyOnly {
+            copySecret(credential.password)
+            message = "Parola panoya kopyalandı; 2 dakika sonra otomatik temizlenecek."
+        } else {
+            revealedPassword = credential.password
+            message = "Parola gösteriliyor; işin bitince gizle."
+        }
+    }
+
+    func generatePassword() async {
+        guard await authenticate(reason: "Mail parolasını güçlü yeni bir parolayla değiştirmek için doğrulayın.") else { return }
+        isWorking = true
+        defer { isWorking = false }
+        let result = await LocalCommand.run("/bin/zsh", [control, "generate", selectedAddress])
+        guard result.exitCode == 0,
+              let payload = result.output.data(using: .utf8),
+              let credential = try? JSONDecoder().decode(MailCredential.self, from: payload) else {
+            message = "Parola değiştirilemedi; mevcut parola korunuyor."
+            return
+        }
+        revealedPassword = credential.password
+        copySecret(credential.password)
+        message = "Yeni güçlü parola uygulandı, test edildi ve panoya kopyalandı."
+    }
+
+    func applyCustomPassword() async {
+        guard newPassword.count >= 12 else {
+            message = "Yeni parola en az 12 karakter olmalı."
+            return
+        }
+        guard await authenticate(reason: "Seçili mail hesabının parolasını değiştirmek için doğrulayın.") else { return }
+        isWorking = true
+        defer { isWorking = false }
+        let value = newPassword
+        let result = await LocalCommand.run("/bin/zsh", [control, "set", selectedAddress], input: value + "\n")
+        guard result.exitCode == 0 else {
+            message = "Parola değiştirilemedi; mevcut parola korunuyor."
+            return
+        }
+        newPassword = ""
+        revealedPassword = value
+        message = "Yeni parola uygulandı ve IMAP/SMTP ile doğrulandı."
+    }
+
+    func copySetup() {
+        guard let server = data?.server else { return }
+        let text = """
+        REDMONO MAIL KURULUMU
+        E-posta / kullanıcı adı: \(selectedAddress)
+        Gelen posta (IMAP): \(server.imap.host)
+        IMAP portu: \(server.imap.port) · \(server.imap.security)
+        Giden posta (SMTP): \(server.smtp.host)
+        SMTP portu: \(server.smtp.port) · \(server.smtp.security) · kimlik doğrulama açık
+        CalDAV: \(server.caldav)
+        CardDAV: \(server.carddav)
+        Webmail: \(server.webmail)
+        Parola yönetimi: \(server.accountManager)
+        Gereksinim: Cihazda Tailscale bağlı olmalı.
+        """
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        message = "Kurulum bilgileri panoya kopyalandı; parola ayrı gönderilmeli."
+    }
+
+    func hidePassword() { revealedPassword = nil }
+
+    private func authenticate(reason: String) async -> Bool {
+        let context = LAContext()
+        context.localizedCancelTitle = "Vazgeç"
+        do { return try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) }
+        catch { return false }
+    }
+
+    private func copySecret(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            if NSPasteboard.general.string(forType: .string) == value {
+                NSPasteboard.general.clearContents()
+            }
+        }
+    }
+}
+
+@MainActor
+private final class MYAL11Monitor: ObservableObject {
+    enum Route: String {
+        case cable = "Kablo · otomatik"
+        case tailscale = "Tailscale · otomatik"
+        case offline = "Bağlantı yok"
+    }
+
+    @Published private(set) var status: MYAL11Status?
+    @Published private(set) var route: Route = .offline
+    @Published private(set) var lastError: String?
+    @Published private(set) var actionMessage: String?
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var isRunningAction = false
+
+    private let statusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/status.json"
+    private let syncPath = NSHomeDirectory() + "/Library/Application Support/DAAK/daak-node-sync.zsh"
+    private let configuration = NodeConfiguration.load()
+    private var timer: Timer?
+    private var lastUPSState: String?
+
+    init() {
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
+        }
+        Task { await refresh() }
+    }
+
+    deinit { timer?.invalidate() }
+
+    // Reachability and telemetry age are intentionally separate. The Mac may be
+    // perfectly reachable while its background status writer is catching up.
+    var isOnline: Bool { route != .offline }
+    var isFresh: Bool {
+        guard let value = status?.updatedAt,
+              let date = ISO8601DateFormatter().date(from: value) else { return false }
+        return abs(date.timeIntervalSinceNow) < 180
+    }
+
+    var routeLabel: String { route.rawValue }
+
+    var connectionSummary: String {
+        guard isOnline else { return "Bağlantı bekleniyor" }
+        return isFresh ? routeLabel : "\(routeLabel) · veri güncelleniyor"
+    }
+
+    func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        _ = await LocalCommand.run("/bin/zsh", [syncPath])
+        await refreshRoute()
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: statusPath))
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let decoded = try decoder.decode(MYAL11Status.self, from: data)
+            status = decoded
+            evaluateUPSNotification(decoded)
+            lastError = isFresh ? nil : "Son telemetri güncel değil."
+        } catch {
+            status = nil
+            lastError = "MYA-L11 telemetrisi okunamadı."
+        }
+    }
+
+    private func refreshRoute() async {
+        if let directHost = configuration?.directHost, !directHost.isEmpty {
+            let cable = await LocalCommand.run("/usr/bin/nc", ["-6", "-z", "-G", "1", directHost, "22"])
+            if cable.exitCode == 0 {
+                route = .cable
+                return
+            }
+        }
+        guard let tailHost = configuration?.tailHost, !tailHost.isEmpty else {
+            route = .offline
+            return
+        }
+        let tail = await LocalCommand.run("/usr/bin/nc", ["-z", "-G", "2", tailHost, "22"])
+        route = tail.exitCode == 0 ? .tailscale : .offline
+    }
+
+    var isOnBattery: Bool {
+        guard let status else { return false }
+        return status.upsState.map { $0 != "ac" } ?? (status.powerSource == "Battery Power")
+    }
+
+    var upsSummary: String {
+        guard let status else { return "UPS telemetrisi bekleniyor" }
+        if let message = status.upsMessage, !message.isEmpty { return message }
+        return isOnBattery
+            ? "Adaptör bağlı değil · pil %\(status.batteryPercent)"
+            : "Adaptör bağlı · pil UPS olarak hazır"
+    }
+
+    private func evaluateUPSNotification(_ newStatus: MYAL11Status) {
+        let newState = newStatus.upsState ?? (newStatus.powerSource == "Battery Power" ? "battery" : "ac")
+        defer { lastUPSState = newState }
+        guard newState != "ac", newState != lastUPSState else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = newState == "critical" || newState == "emergency"
+            ? "MYA-L11 yakında kapanabilir"
+            : "MYA-L11 adaptörden ayrıldı"
+        content.body = newStatus.upsMessage ?? "Intel Mac pilde çalışıyor · %\(newStatus.batteryPercent)"
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "app.daaknode.mya-l11-ups.\(newState)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private var selectedSSHHost: String {
+        route == .cable ? "mya-l11-direct" : "mya-l11-tail"
+    }
+
+    func openScreen() {
+        try? LocalCommand.launch("/bin/zsh", [NSHomeDirectory() + "/Library/Application Support/DAAK/mya-direct.zsh", "screen"])
+        actionMessage = "Ekran Paylaşımı en hızlı kullanılabilir hattan açılıyor."
+    }
+
+    func openDisk() {
+        try? LocalCommand.launch("/bin/zsh", [NSHomeDirectory() + "/Library/Application Support/DAAK/mya-direct.zsh", "disk"])
+    }
+
+    func openSSH() {
+        try? LocalCommand.launch("/usr/bin/open", ["ssh://mya-l11"])
+    }
+
+    func openWebmail() { openURL(configuration?.webmailURL) }
+    func openMailAdmin() { openURL(configuration?.mailAdminURL) }
+    func openCampaigns() { openURL(configuration?.campaignsURL) }
+    func openMailPreview() { openURL(configuration?.mailPreviewURL) }
+    func openContainerPanel() { openURL(configuration?.containerPanelURL) }
+    func openDNSPanel() { openURL(configuration?.dnsPanelURL) }
+
+    func openCalendar() {
+        let calendar = URL(fileURLWithPath: "/System/Applications/Calendar.app")
+        NSWorkspace.shared.openApplication(at: calendar, configuration: .init())
+    }
+
+    func openAccountSettings() {
+        openURL("x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension")
+    }
+
+    private func openURL(_ value: String?) {
+        guard let value, let url = URL(string: value) else {
+            actionMessage = "Bu servis için node-config.json ayarı gerekli."
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    func power(_ action: String) async {
+        guard ["wake", "sleep", "restart", "shutdown"].contains(action), !isRunningAction else { return }
+        isRunningAction = true
+        defer { isRunningAction = false }
+
+        if action == "wake" {
+            guard let mac = configuration?.wakeMAC,
+                  !mac.isEmpty,
+                  let broadcasts = configuration?.wakeBroadcasts,
+                  !broadcasts.isEmpty,
+                  let payload = try? JSONEncoder().encode(broadcasts),
+                  let broadcastJSON = String(data: payload, encoding: .utf8) else {
+                actionMessage = "Wake-on-LAN için node-config.json ayarı gerekli."
+                return
+            }
+            let result = await LocalCommand.run(
+                "/usr/bin/python3",
+                ["-c", "import json,socket,sys; m=bytes.fromhex(sys.argv[1].replace(':','').replace('-','')); p=b'\\xff'*6+m*16; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1); [s.sendto(p,(h,9)) for h in json.loads(sys.argv[2])]", mac, broadcastJSON]
+            )
+            actionMessage = result.exitCode == 0 ? "Uyandırma paketi yerel ağa gönderildi." : "Uyandırma paketi gönderilemedi."
+            return
+        }
+
+        let result = await LocalCommand.run(
+            "/usr/bin/ssh",
+            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4", selectedSSHHost,
+             "sudo -n /usr/local/sbin/daak-node-power \(action)"]
+        )
+        if result.exitCode == 0 {
+            switch action {
+            case "sleep": actionMessage = "MYA-L11 uykuya alındı."
+            case "restart": actionMessage = "MYA-L11 yeniden başlatılıyor."
+            default: actionMessage = "MYA-L11 kapatılıyor. Tekrar açmak fiziksel güç veya çalışan Wake-on-LAN gerektirebilir."
+            }
+        } else {
+            actionMessage = "Güç komutu çalışmadı: \(result.output)"
+        }
+    }
 }
 
 @MainActor
 private final class NodeMonitor: ObservableObject {
     @Published private(set) var status: NodeStatus?
+    @Published private(set) var location: NodeLocation?
     @Published private(set) var lastError: String?
     @Published private(set) var actionMessage: String?
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isSettingExitNode = false
+    @Published private(set) var isPhoneExitNodeAvailable = false
+    @Published private(set) var isUsingPhoneExitNode = false
     @Published var host: String
 
     private let hostKey = "daakNodeHost"
     private let sshPort = "8022"
     private let adbPort = "5555"
+    private let tailscaleCLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
     private var timer: Timer?
 
     init() {
         host = UserDefaults.standard.string(forKey: hostKey) ?? ""
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
         Task { await refresh() }
@@ -302,7 +801,11 @@ private final class NodeMonitor: ObservableObject {
         guard let status else { return "Bağlantı bekleniyor" }
         switch status.state {
         case "ready": return "Konum hazır"
-        case "waiting-for-gps": return "GPS sabitleniyor"
+        case "ready-last-gps": return "Son hassas GPS noktası korunuyor"
+        case "ready-approximate": return "Yaklaşık konum hazır"
+        case "acquiring-gps":
+            return hasLocation ? "Yaklaşık konum hazır · GPS aranıyor" : "Hassas GPS aranıyor"
+        case "waiting-for-gps": return hasLocation ? "Son konum hazır · GPS aranıyor" : "GPS sinyali bekleniyor"
         case "permission-required": return "Konum izni gerekli"
         default: return status.state.replacingOccurrences(of: "-", with: " ").capitalized
         }
@@ -326,6 +829,8 @@ private final class NodeMonitor: ObservableObject {
     }
 
     func refresh() async {
+        await refreshCachedLocation()
+        await refreshExitNodeState()
         guard Self.isSafeHost(host) else {
             status = nil
             lastError = "DAAK NODE Tailscale IP’si geçerli değil."
@@ -344,6 +849,62 @@ private final class NodeMonitor: ObservableObject {
         }
         status = decoded
         lastError = nil
+    }
+
+    func setPhoneExitNode(enabled: Bool) async {
+        guard Self.isSafeHost(host), !isSettingExitNode else { return }
+        isSettingExitNode = true
+        defer { isSettingExitNode = false }
+        let arguments = enabled
+            ? ["set", "--exit-node=\(host)", "--exit-node-allow-lan-access=true"]
+            : ["set", "--exit-node="]
+        let result = await LocalCommand.run(tailscaleCLI, arguments)
+        await refreshExitNodeState()
+        if result.exitCode == 0 {
+            actionMessage = enabled
+                ? "Mac interneti artık S9 üzerinden çıkıyor."
+                : "Mac normal internet rotasına döndü."
+        } else {
+            actionMessage = "S9 çıkış rotası değiştirilemedi: \(result.output)"
+        }
+    }
+
+    private func refreshExitNodeState() async {
+        guard FileManager.default.isExecutableFile(atPath: tailscaleCLI) else {
+            isPhoneExitNodeAvailable = false
+            isUsingPhoneExitNode = false
+            return
+        }
+        let result = await LocalCommand.run(tailscaleCLI, ["status", "--json"])
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(TailnetStatus.self, from: data) else {
+            return
+        }
+        isPhoneExitNodeAvailable = decoded.peers.values.contains {
+            $0.exitNodeOption == true && Self.addresses($0.tailscaleIPs, contain: host)
+        }
+        isUsingPhoneExitNode = Self.addresses(decoded.exitNodeStatus?.tailscaleIPs, contain: host)
+    }
+
+    private static func addresses(_ addresses: [String]?, contain host: String) -> Bool {
+        (addresses ?? []).contains {
+            $0.split(separator: "/", maxSplits: 1).first.map(String.init) == host
+        }
+    }
+
+    private func refreshCachedLocation() async {
+        let result = await LocalCommand.run(NSHomeDirectory() + "/.local/bin/daak-find", ["raw-cached"])
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(NodeLocation.self, from: data),
+              (-90...90).contains(decoded.latitude),
+              (-180...180).contains(decoded.longitude),
+              decoded.accuracyMeters >= 0,
+              decoded.accuracyMeters <= (decoded.provider == "gps" ? 500 : 2_000) else {
+            return
+        }
+        location = decoded
     }
 
     func openFind() async {
@@ -411,6 +972,161 @@ private final class NodeMonitor: ObservableObject {
 }
 
 @MainActor
+private final class SeparationMonitor: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
+    @Published private(set) var distanceMeters: Double?
+    @Published private(set) var statusLabel = "Ayrılma uyarısı hazırlanıyor"
+
+    private let manager = CLLocationManager()
+    private let alertDistance = 750.0
+    private let reunionDistance = 400.0
+    private var phoneLocation: NodeLocation?
+    private var macLocation: CLLocation?
+    private var consecutiveAwaySamples = 0
+    private var hasAlerted = false
+    private var notificationResolved = false
+    private var notificationAllowed = false
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        manager.distanceFilter = 100
+        manager.activityType = .other
+        manager.pausesLocationUpdatesAutomatically = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.notificationResolved = true
+                self.notificationAllowed = granted
+                UserDefaults.standard.set(granted, forKey: "daakSeparationNotificationAllowed")
+                if !granted {
+                    self.statusLabel = "Ayrılma uyarısı için bildirim izni gerekli"
+                }
+            }
+        }
+        manager.requestWhenInUseAuthorization()
+        startIfAuthorized()
+    }
+
+    func updatePhoneLocation(_ location: NodeLocation?) {
+        phoneLocation = location
+        evaluate()
+    }
+
+    func openNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openLocationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        startIfAuthorized()
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let latest = locations.last else { return }
+        macLocation = latest
+        evaluate()
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        statusLabel = "Mac konumu bekleniyor"
+    }
+
+    private func startIfAuthorized() {
+        switch manager.authorizationStatus {
+        case .authorized, .authorizedAlways:
+            manager.startUpdatingLocation()
+            UserDefaults.standard.set(true, forKey: "daakSeparationLocationAllowed")
+            statusLabel = notificationResolved && !notificationAllowed
+                ? "Ayrılma uyarısı için bildirim izni gerekli"
+                : "Ayrılma uyarısı açık · 750 m"
+        case .denied, .restricted:
+            manager.stopUpdatingLocation()
+            UserDefaults.standard.set(false, forKey: "daakSeparationLocationAllowed")
+            statusLabel = "Ayrılma uyarısı için Mac konum izni gerekli"
+        case .notDetermined:
+            statusLabel = "Mac konum izni bekleniyor"
+        @unknown default:
+            statusLabel = "Mac konumu bekleniyor"
+        }
+    }
+
+    private func evaluate() {
+        guard !notificationResolved || notificationAllowed else {
+            statusLabel = "Ayrılma uyarısı için bildirim izni gerekli"
+            return
+        }
+        guard let phoneLocation, let macLocation else { return }
+        let now = Date().timeIntervalSince1970
+        guard now - phoneLocation.capturedAt <= 20 * 60,
+              abs(macLocation.timestamp.timeIntervalSinceNow) <= 5 * 60,
+              macLocation.horizontalAccuracy >= 0,
+              macLocation.horizontalAccuracy <= 500 else {
+            statusLabel = "Ayrılma uyarısı açık · güncel konum bekleniyor"
+            return
+        }
+
+        let phone = CLLocation(
+            coordinate: CLLocationCoordinate2D(
+                latitude: phoneLocation.latitude,
+                longitude: phoneLocation.longitude
+            ),
+            altitude: 0,
+            horizontalAccuracy: phoneLocation.accuracyMeters,
+            verticalAccuracy: -1,
+            timestamp: Date(timeIntervalSince1970: phoneLocation.capturedAt)
+        )
+        let rawDistance = macLocation.distance(from: phone)
+        let effectiveDistance = max(
+            0,
+            rawDistance - macLocation.horizontalAccuracy - phoneLocation.accuracyMeters
+        )
+        distanceMeters = rawDistance
+
+        if effectiveDistance >= alertDistance {
+            consecutiveAwaySamples += 1
+            statusLabel = "Telefon yaklaşık \(Self.distanceText(rawDistance)) uzakta"
+            if consecutiveAwaySamples >= 2 && !hasAlerted {
+                hasAlerted = true
+                sendAwayNotification(distance: rawDistance)
+            }
+        } else if effectiveDistance <= reunionDistance {
+            consecutiveAwaySamples = 0
+            hasAlerted = false
+            statusLabel = "Telefon yanında · ayrılma uyarısı açık"
+        } else {
+            consecutiveAwaySamples = 0
+            statusLabel = "Ayrılma uyarısı açık · \(Self.distanceText(rawDistance))"
+        }
+    }
+
+    private func sendAwayNotification(distance: Double) {
+        let content = UNMutableNotificationContent()
+        content.title = "DAAK NODE senden uzaklaştı"
+        content.body = "Galaxy S9+ yaklaşık \(Self.distanceText(distance)) uzakta. Son konumu DAAK NODE menüsünden açabilirsin."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "app.daaknode.phone-separated",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private static func distanceText(_ distance: Double) -> String {
+        if distance >= 1_000 {
+            return String(format: "%.1f km", distance / 1_000)
+        }
+        return "\(Int(distance.rounded())) m"
+    }
+}
+
+@MainActor
 private final class RelayMonitor: ObservableObject {
     @Published private(set) var status: RelayStatus?
     @Published private(set) var lastError: String?
@@ -427,7 +1143,7 @@ private final class RelayMonitor: ObservableObject {
         host = UserDefaults.standard.string(forKey: hostKey)
             ?? UserDefaults.standard.string(forKey: legacyHostKey)
             ?? ""
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.refresh()
             }
@@ -499,6 +1215,13 @@ private final class RelayMonitor: ObservableObject {
     func openDashboard() {
         guard let baseURL else { return }
         NSWorkspace.shared.open(baseURL)
+    }
+
+    func openRemoteDesktop() {
+        try? LocalCommand.launch(
+            "/bin/zsh",
+            [NSHomeDirectory() + "/Library/Application Support/DAAK/lolile-windows-app.zsh"]
+        )
     }
 
     func setPowerMode(_ mode: String) async {
@@ -668,7 +1391,10 @@ private struct MetricRow: View {
 
 private enum DevicePanel: String, CaseIterable, Identifiable {
     case devices
+    case services
+    case mail
     case lolile
+    case myaL11
     case node
 
     var id: String { rawValue }
@@ -676,8 +1402,123 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .devices: return "Cihazlar"
+        case .services: return "Servisler"
+        case .mail: return "Mail"
         case .lolile: return "LOLİLE"
+        case .myaL11: return "MYA-L11"
         case .node: return "S9+"
+        }
+    }
+}
+
+private struct MailAccountsView: View {
+    @EnvironmentObject private var mail: MailAccountMonitor
+    @State private var confirmsGenerate = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 13) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("MAIL HESAPLARI").font(.headline)
+                        Text("IMAP · SMTP · Takvim · Parola").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if mail.isWorking { ProgressView().controlSize(.small) }
+                }
+
+                if let accounts = mail.data?.accounts, !accounts.isEmpty {
+                    Picker("Hesap", selection: $mail.selectedAddress) {
+                        ForEach(accounts) { account in
+                            Text("\(account.displayName) · \(account.address)").tag(account.address)
+                        }
+                    }
+                    .labelsHidden()
+
+                    if let account = mail.selectedAccount {
+                        VStack(spacing: 8) {
+                            MetricRow(title: "E-posta", value: account.address)
+                            MetricRow(title: "Kota", value: ByteCountFormatter.string(fromByteCount: account.quotaBytes, countStyle: .file))
+                            MetricRow(title: "Parola deposu", value: account.passwordStored ? "Güvenli · hazır" : "Kontrol gerekli")
+                        }
+                    }
+
+                    if let server = mail.data?.server {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Mail uygulaması ayarları").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            MetricRow(title: "IMAP", value: "\(server.imap.host):\(server.imap.port) · \(server.imap.security)")
+                            MetricRow(title: "SMTP", value: "\(server.smtp.host):\(server.smtp.port) · \(server.smtp.security)")
+                            MetricRow(title: "Kullanıcı", value: mail.selectedAddress)
+                            Text("Begüm’ün cihazında Tailscale kurulu ve bağlı olmalı.")
+                                .font(.caption2).foregroundStyle(.orange)
+                        }
+                        .padding(10)
+                        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
+                    }
+
+                    HStack(spacing: 7) {
+                        Button("Kurulumu kopyala", action: mail.copySetup)
+                        Button("Parolayı kopyala") { Task { await mail.revealOrCopy(copyOnly: true) } }
+                        Button(mail.revealedPassword == nil ? "Parolayı göster" : "Gizle") {
+                            if mail.revealedPassword == nil { Task { await mail.revealOrCopy(copyOnly: false) } }
+                            else { mail.hidePassword() }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    if let password = mail.revealedPassword {
+                        HStack {
+                            Text(password)
+                                .font(.callout.monospaced())
+                                .textSelection(.enabled)
+                            Spacer()
+                            Image(systemName: "eye.fill").foregroundStyle(.orange)
+                        }
+                        .padding(10)
+                        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                    }
+
+                    Divider()
+
+                    Text("Parolayı değiştir").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    SecureField("En az 12 karakter", text: $mail.newPassword)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Button("Yazdığım parolayı uygula") { Task { await mail.applyCustomPassword() } }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(mail.newPassword.count < 12 || mail.isWorking)
+                        Button("Güçlü parola üret") { confirmsGenerate = true }
+                            .buttonStyle(.bordered)
+                            .disabled(mail.isWorking)
+                    }
+
+                    Text("Parola değişince eski telefon/PC bağlantıları durur; yeni parolayı cihazlara tekrar girmek gerekir.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if mail.isWorking {
+                    Text("Hesaplar yükleniyor…").font(.callout).foregroundStyle(.secondary)
+                } else {
+                    Text("Mail hesabı bulunamadı.").font(.callout).foregroundStyle(.secondary)
+                }
+
+                if let message = mail.message {
+                    Text(message).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack {
+                    Button("Yenile") { Task { await mail.refresh() } }.buttonStyle(.borderless)
+                    Spacer()
+                    Text("Parolalar Git’e ve uygulamaya yazılmaz").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .padding(16)
+        }
+        .frame(maxHeight: 700)
+        .confirmationDialog("\(mail.selectedAddress) için yeni güçlü parola üretilsin mi?", isPresented: $confirmsGenerate) {
+            Button("Üret ve değiştir") { Task { await mail.generatePassword() } }
+            Button("Vazgeç", role: .cancel) {}
+        } message: {
+            Text("Mevcut parola geçersiz olacak; mail uygulamalarına yeni parolayı girmen gerekecek.")
         }
     }
 }
@@ -744,6 +1585,7 @@ private struct DeviceCard: View {
 private struct DeviceOverviewView: View {
     @EnvironmentObject private var relay: RelayMonitor
     @EnvironmentObject private var node: NodeMonitor
+    @EnvironmentObject private var myaL11: MYAL11Monitor
     @Binding var selection: DevicePanel
 
     var body: some View {
@@ -758,9 +1600,22 @@ private struct DeviceOverviewView: View {
                 symbol: "desktopcomputer",
                 online: relay.isConnected,
                 status: relay.isConnected ? "Tailscale üzerinden bağlı" : "Bağlantı bekleniyor",
-                actionTitle: "Paneli aç",
-                action: relay.openDashboard,
+                actionTitle: "Ekranı aç",
+                action: relay.openRemoteDesktop,
                 openDetails: { selection = .lolile }
+            )
+
+            DeviceCard(
+                name: "MYA-L11",
+                detail: "Intel Mac · Sunucu · Ekran · Disk",
+                symbol: "laptopcomputer",
+                online: myaL11.isOnline,
+                status: myaL11.isOnline && myaL11.isOnBattery
+                    ? myaL11.upsSummary
+                    : myaL11.connectionSummary,
+                actionTitle: "Ekranı aç",
+                action: myaL11.openScreen,
+                openDetails: { selection = .myaL11 }
             )
 
             DeviceCard(
@@ -798,12 +1653,13 @@ private struct DeviceOverviewView: View {
                     Task {
                         async let relayRefresh: Void = relay.refresh()
                         async let nodeRefresh: Void = node.refresh()
-                        _ = await (relayRefresh, nodeRefresh)
+                        async let myaRefresh: Void = myaL11.refresh()
+                        _ = await (relayRefresh, nodeRefresh, myaRefresh)
                     }
                 } label: {
                     Label("Tümünü yenile", systemImage: "arrow.clockwise")
                 }
-                .disabled(relay.isRefreshing || node.isRefreshing)
+                .disabled(relay.isRefreshing || node.isRefreshing || myaL11.isRefreshing)
 
                 Spacer()
 
@@ -817,8 +1673,252 @@ private struct DeviceOverviewView: View {
     }
 }
 
+private struct ServiceShortcut: View {
+    let title: String
+    let detail: String
+    let symbol: String
+    let tint: Color
+    let available: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: symbol)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 34, height: 34)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.callout.weight(.semibold))
+                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Circle()
+                    .fill(available ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                Image(systemName: "arrow.up.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+        .disabled(!available)
+    }
+}
+
+private struct ServerServicesView: View {
+    @EnvironmentObject private var monitor: MYAL11Monitor
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("REDMONO SUNUCU MERKEZİ").font(.headline)
+                        Text("Mail · Takvim · Linux · DNS").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    StatusPill(online: monitor.isOnline)
+                }
+
+                Text("Servisler yalnızca kablo veya güvenli Tailnet üzerinden açılır.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Group {
+                    Text("Mail ve takvim").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ServiceShortcut(title: "Webmail", detail: "Gelen kutusu ve mail gönderme", symbol: "envelope.fill", tint: .blue, available: monitor.isOnline && (monitor.status?.services.webmail ?? true), action: monitor.openWebmail)
+                    ServiceShortcut(title: "Mail ve takvim yönetimi", detail: "Hesaplar, alan adları, CalDAV/CardDAV", symbol: "person.crop.circle.badge.gearshape", tint: .purple, available: monitor.isOnline && (monitor.status?.services.mail ?? true), action: monitor.openMailAdmin)
+                    ServiceShortcut(title: "Takvim", detail: "Mac Takvim uygulamasını aç", symbol: "calendar", tint: .red, available: true, action: monitor.openCalendar)
+                    ServiceShortcut(title: "Hesabı Mac’e ekle", detail: "Mail + Takvim için İnternet Hesapları", symbol: "person.badge.plus", tint: .indigo, available: true, action: monitor.openAccountSettings)
+                    ServiceShortcut(title: "Kampanyalar", detail: "Listeler ve toplu gönderimler", symbol: "paperplane.fill", tint: .orange, available: monitor.isOnline && (monitor.status?.services.listmonk ?? true), action: monitor.openCampaigns)
+                    ServiceShortcut(title: "Test posta kutusu", detail: "Dışarı çıkmayan güvenli önizleme", symbol: "shippingbox.fill", tint: .mint, available: monitor.isOnline, action: monitor.openMailPreview)
+                }
+
+                Divider()
+
+                Group {
+                    Text("Linux altyapısı").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ServiceShortcut(title: "Konteyner paneli", detail: "Portainer · servisleri gör ve yönet", symbol: "shippingbox.and.arrow.backward.fill", tint: .teal, available: monitor.isOnline, action: monitor.openContainerPanel)
+                    ServiceShortcut(title: "DNS ve reklam engelleme", detail: "AdGuard Home", symbol: "shield.lefthalf.filled", tint: .green, available: monitor.isOnline && (monitor.status?.services.adblock ?? true), action: monitor.openDNSPanel)
+                    ServiceShortcut(title: "Sunucu ekranı", detail: "Tek tuş Apple Ekran Paylaşımı", symbol: "rectangle.on.rectangle", tint: .cyan, available: monitor.isOnline, action: monitor.openScreen)
+                    ServiceShortcut(title: "Sunucu terminali", detail: "SSH bağlantısını aç", symbol: "terminal.fill", tint: .gray, available: monitor.isOnline, action: monitor.openSSH)
+                }
+
+                HStack {
+                    Text(monitor.connectionSummary).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Yenile") { Task { await monitor.refresh() } }
+                        .buttonStyle(.borderless)
+                        .disabled(monitor.isRefreshing)
+                }
+            }
+            .padding(16)
+        }
+        .frame(maxHeight: 700)
+    }
+}
+
+private struct MYAL11MenuView: View {
+    @EnvironmentObject private var monitor: MYAL11Monitor
+    @State private var confirmsShutdown = false
+    @State private var confirmsRestart = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("MYA-L11")
+                        .font(.headline)
+                    Text("Intel i9 MacBook Pro 16 · sunucu")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                StatusPill(online: monitor.isOnline)
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: monitor.route == .cable ? "cable.connector" : "network")
+                    .foregroundStyle(monitor.isOnline ? Color.green : Color.orange)
+                Text(monitor.routeLabel)
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Text("Kablo öncelikli · otomatik geçiş")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+
+            if let status = monitor.status {
+                HStack(spacing: 8) {
+                    Image(systemName: monitor.isOnBattery ? "exclamationmark.triangle.fill" : "battery.100percent.bolt")
+                        .foregroundStyle(monitor.isOnBattery ? Color.orange : Color.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(monitor.isOnBattery ? "UPS DEVREDE" : "UPS HAZIR")
+                            .font(.caption.weight(.bold))
+                        Text(monitor.upsSummary)
+                            .font(.caption2)
+                            .foregroundStyle(monitor.isOnBattery ? Color.orange : Color.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(10)
+                .background(
+                    (monitor.isOnBattery ? Color.orange : Color.green).opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+
+                VStack(spacing: 9) {
+                    MetricRow(title: "Pil", value: "%\(status.batteryPercent) · \(status.batteryCondition) · \(status.batteryCycles) döngü")
+                    MetricRow(title: "Güç", value: status.powerSource)
+                    if monitor.isOnBattery, let minutes = status.batteryMinutesRemaining, minutes >= 0 {
+                        MetricRow(title: "Tahmini süre", value: "\(minutes) dakika")
+                    }
+                    MetricRow(title: "CPU", value: status.cpuUsagePercent.map { String(format: "%%%.0f", $0) } ?? status.loadAverage.trimmingCharacters(in: .whitespaces))
+                    MetricRow(title: "CPU sıcaklığı", value: status.cpuTemperatureC.map { String(format: "%.0f°C", $0) } ?? "Sensör okunamadı")
+                    MetricRow(title: "GPU sıcaklığı", value: status.gpuTemperatureC.map { String(format: "%.0f°C", $0) } ?? "Sensör okunamadı")
+                    MetricRow(title: "Boş RAM", value: "%\(status.memoryFreePercent)")
+                    MetricRow(title: "Boş disk", value: Self.formatKB(status.diskFreeKB))
+                    MetricRow(title: "Docker", value: "\(status.dockerContainersRunning) konteyner")
+                    MetricRow(title: "Stats", value: status.services.stats == true ? "Çalışıyor" : "Kontrol gerekli")
+                    MetricRow(title: "SSH / Ekran", value: status.services.ssh && status.services.screenSharing ? "Açık / Açık" : "Kontrol gerekli")
+                    MetricRow(title: "Uyanık tutma", value: status.services.caffeinateGuard ? "Aktif" : "Kontrol gerekli")
+                }
+            } else {
+                Text(monitor.lastError ?? "Telemetri bekleniyor…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button(action: monitor.openScreen) {
+                    Label("Ekran", systemImage: "rectangle.on.rectangle")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(monitor.route == .offline)
+
+                Button(action: monitor.openDisk) {
+                    Label("Disk", systemImage: "externaldrive")
+                }
+                .buttonStyle(.bordered)
+                .disabled(monitor.route == .offline)
+
+                Button(action: monitor.openSSH) {
+                    Label("SSH", systemImage: "terminal")
+                }
+                .buttonStyle(.bordered)
+                .disabled(monitor.route == .offline)
+            }
+
+            Divider()
+
+            HStack(spacing: 7) {
+                Button("Uyandır") { Task { await monitor.power("wake") } }
+                    .disabled(monitor.isRunningAction)
+                Button("Uyut") { Task { await monitor.power("sleep") } }
+                    .disabled(!monitor.isOnline || monitor.isRunningAction)
+                Button("Yeniden başlat") { confirmsRestart = true }
+                    .disabled(!monitor.isOnline || monitor.isRunningAction)
+                Button("Kapat") { confirmsShutdown = true }
+                    .disabled(!monitor.isOnline || monitor.isRunningAction)
+                    .tint(.red)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Text("Kapatma sonrası Wake-on-LAN garanti değildir; uzaktan erişimi kaybetmemek için normalde yeniden başlat veya uyut.")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+
+            if let message = monitor.actionMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Button {
+                    Task { await monitor.refresh() }
+                } label: {
+                    Label("Yenile", systemImage: "arrow.clockwise")
+                }
+                .disabled(monitor.isRefreshing)
+                Spacer()
+                Text("Yalnızca kablo / Tailnet")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(16)
+        .confirmationDialog("MYA-L11 yeniden başlatılsın mı?", isPresented: $confirmsRestart) {
+            Button("Yeniden başlat") { Task { await monitor.power("restart") } }
+            Button("Vazgeç", role: .cancel) {}
+        }
+        .confirmationDialog("MYA-L11 kapatılsın mı?", isPresented: $confirmsShutdown) {
+            Button("Kapat", role: .destructive) { Task { await monitor.power("shutdown") } }
+            Button("Vazgeç", role: .cancel) {}
+        } message: {
+            Text("Tamamen kapandıktan sonra uzaktan yeniden açılması garanti değildir.")
+        }
+    }
+
+    private static func formatKB(_ value: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: max(0, value) * 1024)
+    }
+}
+
 private struct NodeMenuView: View {
     @EnvironmentObject private var node: NodeMonitor
+    @EnvironmentObject private var separation: SeparationMonitor
     @State private var draftHost = ""
 
     var body: some View {
@@ -856,6 +1956,24 @@ private struct NodeMenuView: View {
                 Text(node.lastLocationLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                HStack(spacing: 5) {
+                    Image(systemName: "bell.and.waves.left.and.right")
+                    Text(separation.statusLabel)
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                if separation.statusLabel.contains("izin gerekli") {
+                    HStack(spacing: 10) {
+                        Button("Bildirim izni") {
+                            separation.openNotificationSettings()
+                        }
+                        Button("Konum izni") {
+                            separation.openLocationSettings()
+                        }
+                    }
+                    .font(.caption)
+                    .buttonStyle(.link)
+                }
                 if let detail = node.status?.lastError, !detail.isEmpty {
                     Text(detail)
                         .font(.caption2)
@@ -891,6 +2009,25 @@ private struct NodeMenuView: View {
                 .buttonStyle(.bordered)
                 .disabled(!node.isOnline)
             }
+
+            Button {
+                Task { await node.setPhoneExitNode(enabled: !node.isUsingPhoneExitNode) }
+            } label: {
+                Label(
+                    node.isUsingPhoneExitNode ? "S9 çıkışını kapat" : "Mac’i S9 üzerinden çıkar",
+                    systemImage: node.isUsingPhoneExitNode ? "network.slash" : "shield.lefthalf.filled"
+                )
+            }
+            .buttonStyle(.bordered)
+            .disabled(!node.isPhoneExitNodeAvailable || node.isSettingExitNode)
+
+            Text(
+                node.isUsingPhoneExitNode
+                    ? "Açık · IP tabanlı konum S9’un internet çıkışını kullanıyor."
+                    : "Kapalı · VPN/exit node yalnızca istediğinde açılır."
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
 
             if let message = node.actionMessage {
                 Text(message)
@@ -951,6 +2088,9 @@ private struct NodeMenuView: View {
 private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var relay: RelayMonitor
     @EnvironmentObject private var node: NodeMonitor
+    @EnvironmentObject private var myaL11: MYAL11Monitor
+    @EnvironmentObject private var separation: SeparationMonitor
+    @EnvironmentObject private var mail: MailAccountMonitor
     @State private var selection: DevicePanel = .devices
 
     var body: some View {
@@ -966,7 +2106,7 @@ private struct DAAKDevicesMenuView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("\([relay.isConnected, node.isOnline].filter { $0 }.count)/2 bağlı")
+                Text("\([relay.isConnected, myaL11.isOnline, node.isOnline].filter { $0 }.count)/3 bağlı")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -989,16 +2129,25 @@ private struct DAAKDevicesMenuView: View {
             switch selection {
             case .devices:
                 DeviceOverviewView(selection: $selection)
+            case .services:
+                ServerServicesView()
+            case .mail:
+                MailAccountsView()
             case .lolile:
                 ScrollView {
                     RelayMenuView()
                 }
                 .frame(maxHeight: 690)
+            case .myaL11:
+                MYAL11MenuView()
             case .node:
                 NodeMenuView()
             }
         }
         .frame(width: 420)
+        .onReceive(node.$location) { location in
+            separation.updatePhoneLocation(location)
+        }
     }
 }
 
@@ -1295,6 +2444,12 @@ private struct RelayMenuView: View {
                 }
                 .disabled(monitor.baseURL == nil)
 
+                Button {
+                    monitor.openRemoteDesktop()
+                } label: {
+                    Label("Windows App", systemImage: "display")
+                }
+
                 Spacer()
 
                 Button("Çıkış") {
@@ -1333,15 +2488,22 @@ private struct RelayMenuView: View {
 struct daakLOLILEApp: App {
     @StateObject private var relay = RelayMonitor()
     @StateObject private var node = NodeMonitor()
+    @StateObject private var myaL11 = MYAL11Monitor()
+    @StateObject private var separation = SeparationMonitor()
+    @StateObject private var mail = MailAccountMonitor()
 
     var body: some Scene {
         MenuBarExtra {
             DAAKDevicesMenuView()
                 .environmentObject(relay)
                 .environmentObject(node)
+                .environmentObject(myaL11)
+                .environmentObject(separation)
+                .environmentObject(mail)
         } label: {
-            Image(systemName: "circle.grid.2x2.fill")
-                .accessibilityLabel("DAAK NODE cihaz merkezi")
+            Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "circle.grid.2x2.fill")
+                .symbolRenderingMode(.hierarchical)
+            .accessibilityLabel("DAAK NODE cihaz merkezi")
         }
         .menuBarExtraStyle(.window)
     }
