@@ -369,6 +369,13 @@ private struct NodeConfiguration: Decodable {
     let mailPreviewURL: String?
     let containerPanelURL: String?
     let dnsPanelURL: String?
+    let brevoSMTPURL: String?
+    let brevoDomainsURL: String?
+    let brevoSMTPHost: String?
+    let brevoSMTPPort: Int?
+    let brevoSMTPLogin: String?
+    let inboundProvider: String?
+    let inboundMX: String?
     let wakeMAC: String?
     let wakeBroadcasts: [String]?
 
@@ -573,6 +580,7 @@ private final class MailAccountMonitor: ObservableObject {
     @Published private(set) var isWorking = false
 
     private let control = NSHomeDirectory() + "/Library/Application Support/DAAK/mail-account-control.zsh"
+    private let configuration = NodeConfiguration.load()
 
     init() { Task { await refresh() } }
 
@@ -657,18 +665,33 @@ private final class MailAccountMonitor: ObservableObject {
 
     func copySetup() {
         guard let server = data?.server else { return }
+        let relayHost = configuration?.brevoSMTPHost ?? "smtp-relay.brevo.com"
+        let relayPort = configuration?.brevoSMTPPort ?? 587
+        let inboundProvider = configuration?.inboundProvider ?? "IONOS (MX geçişi yapılmadı)"
+        let inboundMX = configuration?.inboundMX ?? "mx00.ionos.es / mx01.ionos.es"
         let text = """
         REDMONO MAIL KURULUMU
         E-posta / kullanıcı adı: \(selectedAddress)
+
+        MAIL UYGULAMASINA YAZILACAK
         Gelen posta (IMAP): \(server.imap.host)
         IMAP portu: \(server.imap.port) · \(server.imap.security)
         Giden posta (SMTP): \(server.smtp.host)
         SMTP portu: \(server.smtp.port) · \(server.smtp.security) · kimlik doğrulama açık
+        IMAP ve SMTP kullanıcı adı: \(selectedAddress)
+
+        ARKA PLAN TESLİMATI
+        Giden relay: Brevo · \(relayHost):\(relayPort) · STARTTLS
+        Brevo bilgileri mail uygulamasına yazılmaz; MYA-L11 bunları güvenli depodan kullanır.
+        Brevo IMAP veya gelen posta kutusu sağlamaz.
+        redmono.com mevcut gelen MX: \(inboundProvider) · \(inboundMX)
+
+        TAKVİM VE KİŞİLER
         CalDAV: \(server.caldav)
         CardDAV: \(server.carddav)
         Webmail: \(server.webmail)
         Parola yönetimi: \(server.accountManager)
-        Gereksinim: Cihazda Tailscale bağlı olmalı.
+        Gereksinim: Özel IMAP/SMTP, webmail ve takvim için cihazda Tailscale bağlı olmalı.
         """
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -900,6 +923,8 @@ private final class MYAL11Monitor: ObservableObject {
     func openMailPreview() { openURL(configuration?.mailPreviewURL) }
     func openContainerPanel() { openURL(configuration?.containerPanelURL) }
     func openDNSPanel() { openURL(configuration?.dnsPanelURL) }
+    func openBrevoSMTP() { openURL(configuration?.brevoSMTPURL) }
+    func openBrevoDomains() { openURL(configuration?.brevoDomainsURL) }
 
     func openCalendar() {
         let calendar = URL(fileURLWithPath: "/System/Applications/Calendar.app")
@@ -1738,6 +1763,7 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
 private struct MailAccountsView: View {
     @EnvironmentObject private var mail: MailAccountMonitor
     @State private var confirmsGenerate = false
+    private let configuration = NodeConfiguration.load()
 
     var body: some View {
         ScrollView {
@@ -1745,7 +1771,7 @@ private struct MailAccountsView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("MAIL HESAPLARI").font(.headline)
-                        Text("IMAP · SMTP · Takvim · Parola").font(.caption).foregroundStyle(.secondary)
+                        Text("Gelen · Giden · Brevo relay · Takvim · Parola").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if mail.isWorking { ProgressView().controlSize(.small) }
@@ -1762,22 +1788,56 @@ private struct MailAccountsView: View {
                     if let account = mail.selectedAccount {
                         VStack(spacing: 8) {
                             MetricRow(title: "E-posta", value: account.address)
+                            MetricRow(title: "Kullanılan", value: ByteCountFormatter.string(fromByteCount: account.usedBytes, countStyle: .file))
+                            MetricRow(title: "Kalan", value: ByteCountFormatter.string(fromByteCount: max(0, account.quotaBytes - account.usedBytes), countStyle: .file))
                             MetricRow(title: "Kota", value: ByteCountFormatter.string(fromByteCount: account.quotaBytes, countStyle: .file))
+                            ProgressView(value: min(1, account.quotaBytes > 0 ? Double(account.usedBytes) / Double(account.quotaBytes) : 0))
+                                .tint(account.quotaBytes > 0 && Double(account.usedBytes) / Double(account.quotaBytes) >= 0.9 ? .red : .blue)
+                            HStack {
+                                Text("Doluluk")
+                                Spacer()
+                                Text(account.quotaBytes > 0 ? String(format: "%.2f%%", Double(account.usedBytes) / Double(account.quotaBytes) * 100) : "—")
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                             MetricRow(title: "Parola deposu", value: account.passwordStored ? "Güvenli · hazır" : "Kontrol gerekli")
                         }
                     }
 
                     if let server = mail.data?.server {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Mail uygulaması ayarları").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                            MetricRow(title: "IMAP", value: "\(server.imap.host):\(server.imap.port) · \(server.imap.security)")
-                            MetricRow(title: "SMTP", value: "\(server.smtp.host):\(server.smtp.port) · \(server.smtp.security)")
+                            Text("1 · Mail uygulamasına yazılacak").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            MetricRow(title: "Gelen IMAP", value: "\(server.imap.host):\(server.imap.port) · \(server.imap.security)")
+                            MetricRow(title: "Giden SMTP", value: "\(server.smtp.host):\(server.smtp.port) · \(server.smtp.security)")
                             MetricRow(title: "Kullanıcı", value: mail.selectedAddress)
-                            Text("Begüm’ün cihazında Tailscale kurulu ve bağlı olmalı.")
+                            Text("Parola seçili posta kutusunun parolasıdır. Cihazda Tailscale açık olmalı.")
                                 .font(.caption2).foregroundStyle(.orange)
                         }
                         .padding(10)
                         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("2 · Giden postanın arka plan yolu").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            MetricRow(title: "Akış", value: "Mail uygulaması → MYA-L11 → Brevo → alıcı")
+                            MetricRow(title: "Brevo relay", value: "\(configuration?.brevoSMTPHost ?? "smtp-relay.brevo.com"):\(configuration?.brevoSMTPPort ?? 587) · STARTTLS")
+                            if let login = configuration?.brevoSMTPLogin {
+                                MetricRow(title: "Brevo oturumu", value: login)
+                            }
+                            Text("Brevo bir IMAP/gelen kutusu değildir. Brevo anahtarı mail uygulamasına verilmez; MYA-L11 güvenli depodan kullanır.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .padding(10)
+                        .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("3 · redmono.com gelen posta durumu").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            MetricRow(title: "Mevcut sağlayıcı", value: configuration?.inboundProvider ?? "IONOS")
+                            MetricRow(title: "MX", value: configuration?.inboundMX ?? "mx00.ionos.es / mx01.ionos.es")
+                            Text("MX henüz özel sunucuya taşınmadı. İnternetten gelen gerçek postanın ilk durağı hâlâ IONOS.")
+                                .font(.caption2).foregroundStyle(.orange)
+                        }
+                        .padding(10)
+                        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
                     }
 
                     HStack(spacing: 7) {
@@ -1790,6 +1850,16 @@ private struct MailAccountsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+
+                    HStack(spacing: 12) {
+                        if let value = configuration?.brevoSMTPURL, let url = URL(string: value) {
+                            Link("Brevo SMTP paneli", destination: url)
+                        }
+                        if let value = configuration?.brevoDomainsURL, let url = URL(string: value) {
+                            Link("Brevo domain durumu", destination: url)
+                        }
+                    }
+                    .font(.caption)
 
                     if let password = mail.revealedPassword {
                         HStack {
@@ -2098,6 +2168,8 @@ private struct ServerServicesView: View {
                     ServiceShortcut(title: "Hesabı Mac’e ekle", detail: "Mail + Takvim için İnternet Hesapları", symbol: "person.badge.plus", tint: .indigo, available: true, action: monitor.openAccountSettings)
                     ServiceShortcut(title: "Kampanyalar", detail: "Listeler ve toplu gönderimler", symbol: "paperplane.fill", tint: .orange, available: monitor.isOnline && (monitor.status?.services.listmonk ?? true), action: monitor.openCampaigns)
                     ServiceShortcut(title: "Test posta kutusu", detail: "Dışarı çıkmayan güvenli önizleme", symbol: "shippingbox.fill", tint: .mint, available: monitor.isOnline, action: monitor.openMailPreview)
+                    ServiceShortcut(title: "Brevo SMTP ve API", detail: "Giden relay, anahtarlar ve kullanım", symbol: "paperplane.circle.fill", tint: .blue, available: true, action: monitor.openBrevoSMTP)
+                    ServiceShortcut(title: "Brevo domain doğrulama", detail: "redmono.com DKIM ve doğrulama durumu", symbol: "checkmark.seal.fill", tint: .green, available: true, action: monitor.openBrevoDomains)
                 }
 
                 Divider()
