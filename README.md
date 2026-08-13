@@ -92,11 +92,17 @@ http://100.x.y.z:17657
 
 1. Install and connect Tailscale on both devices.
 2. Copy the `macos` folder to the Mac.
-3. In Terminal, run `zsh build.command` from that folder.
+3. In Terminal, run `zsh install.command` from that folder once.
 4. Enter the Windows PC's Tailscale IP in the LOLİLE device panel and choose **Connect**.
 5. Use the single DAAK NODE menu bar icon to switch between the device overview, LOLİLE, and the enrolled Galaxy S9+.
 6. Switch between automatic, night-saving, balanced, and high-performance modes from the LOLİLE panel.
 7. The build command prints the signed app path under `~/Library/Caches/DAAKNodeHub/build`. Optionally move the app to Applications and add it under **System Settings → General → Login Items**.
+
+After the one-time installation, the Mac app follows the repository's `main`
+channel. It performs a lightweight commit check at launch and every six hours,
+builds only when a new commit exists, verifies the locally signed bundle, retains
+a rollback copy, installs it into `/Applications`, and relaunches. Local device and
+mail configuration under `~/Library/Application Support/DAAK` is never replaced.
 
 The optional S9+ actions require the local DAAK Find client plus `adb` and `scrcpy`. They use fixed, argument-only commands over the phone's private Tailscale addresses; the app does not expose a new network service. **Find on map** remains unavailable until the phone has produced a real GPS fix. Location data is not sent to the Windows dashboard.
 

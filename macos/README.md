@@ -20,3 +20,16 @@ for server reachability, service shortcuts and Wake-on-LAN; it must not be
 committed because it contains device-specific network identifiers.
 
 The app stores only the selected host in macOS user defaults. It can read status and request one of four predefined power modes; it cannot edit Tor settings, attach external volunteer-computing accounts, or execute arbitrary commands. Tor, Snowflake, Folding@home, BOINC, RIPE Atlas, and the hardware collector continue to run on the Windows PC, not on the Mac.
+
+## Updates
+
+Run `zsh install.command` once. The installed app then checks the repository's
+`main` branch at launch and every six hours. When the commit changes, it downloads
+that exact source archive, builds it locally with Apple's Swift compiler, verifies
+the ad-hoc code signature, keeps the previous app as a rollback copy, replaces the
+bundle in `/Applications`, and relaunches itself. Device-specific configuration in
+`~/Library/Application Support/DAAK` remains untouched.
+
+The bottom of the menu shows the installed version and commit, plus a manual
+**Kontrol et** / **Güncelle** action. Automatic checks do not download or rebuild
+anything while the installed commit already matches `main`.
