@@ -681,12 +681,13 @@ private final class MYAL11Monitor: ObservableObject {
 
     private let statusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/status.json"
     private let syncPath = NSHomeDirectory() + "/Library/Application Support/DAAK/daak-node-sync.zsh"
+    private let routeSelectorPath = NSHomeDirectory() + "/Library/Application Support/DAAK/mya-direct.zsh"
     private let configuration = NodeConfiguration.load()
     private var timer: Timer?
     private var lastUPSState: String?
 
     init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
         Task { await refresh() }
@@ -708,6 +709,15 @@ private final class MYAL11Monitor: ObservableObject {
     var connectionSummary: String {
         guard isOnline else { return "Bağlantı bekleniyor" }
         return isFresh ? routeLabel : "\(routeLabel) · veri güncelleniyor"
+    }
+
+    var overviewSummary: String {
+        guard isOnline else { return connectionSummary }
+        var parts = [connectionSummary]
+        if let cpu = status?.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", cpu)) }
+        if let gpu = status?.gpuTemperatureC { parts.append(String(format: "GPU %.0f°C", gpu)) }
+        if isOnBattery, let battery = status?.batteryPercent { parts.append("Pilde %\(battery)") }
+        return parts.joined(separator: " · ")
     }
 
     func refresh() async {
@@ -732,6 +742,25 @@ private final class MYAL11Monitor: ObservableObject {
     }
 
     private func refreshRoute() async {
+        if FileManager.default.isExecutableFile(atPath: routeSelectorPath) {
+            let selected = await LocalCommand.run("/bin/zsh", [routeSelectorPath, "status"])
+            switch selected.output.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "cable", "thunderbolt":
+                route = .cable
+                return
+            case "tailscale":
+                route = .tailscale
+                return
+            case "offline":
+                route = .offline
+                return
+            default:
+                break
+            }
+        }
+
+        // Keep the configuration probes as a compatibility fallback for older
+        // installations that do not have the shared route selector yet.
         if let directHost = configuration?.directHost, !directHost.isEmpty {
             let cable = await LocalCommand.run("/usr/bin/nc", ["-6", "-z", "-G", "1", directHost, "22"])
             if cable.exitCode == 0 {
@@ -793,7 +822,8 @@ private final class MYAL11Monitor: ObservableObject {
     }
 
     func openSSH() {
-        try? LocalCommand.launch("/usr/bin/open", ["ssh://mya-l11"])
+        try? LocalCommand.launch("/bin/zsh", [routeSelectorPath, "ssh"])
+        actionMessage = "SSH en hızlı kullanılabilir hattan açılıyor."
     }
 
     func openWebmail() { openURL(configuration?.webmailURL) }
@@ -1666,7 +1696,7 @@ private struct DeviceCard: View {
                 Text(status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
                 Spacer()
                 Button(actionTitle, action: action)
                     .buttonStyle(.bordered)
@@ -1706,9 +1736,7 @@ private struct DeviceOverviewView: View {
                 detail: "Intel Mac · Sunucu · Ekran · Disk",
                 symbol: "laptopcomputer",
                 online: myaL11.isOnline,
-                status: myaL11.isOnline && myaL11.isOnBattery
-                    ? myaL11.upsSummary
-                    : myaL11.connectionSummary,
+                status: myaL11.overviewSummary,
                 actionTitle: "Ekranı aç",
                 action: myaL11.openScreen,
                 openDetails: { selection = .myaL11 }
