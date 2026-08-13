@@ -100,6 +100,12 @@ fi
   /usr/bin/ditto "$candidate" "$staging"
   /usr/bin/codesign --verify --deep --strict "$staging"
 
+  launch_agent="$HOME/Library/LaunchAgents/app.daaknode.system-ui.plist"
+  launch_domain="gui/$(id -u)"
+  launch_label='app.daaknode.system-ui'
+  /bin/launchctl bootout "$launch_domain/$launch_label" 2>/dev/null || true
+  /usr/bin/pkill -x daakLOLILE 2>/dev/null || true
+
   backup_dir="$cache_dir/previous"
   mkdir -p "$backup_dir"
   backup="$backup_dir/daakLOLILE-$(date -u '+%Y%m%d-%H%M%S').app"
@@ -108,10 +114,12 @@ fi
   fi
   if ! /bin/mv "$staging" "$app"; then
     [[ ! -e "$app" && -e "$backup" ]] && /bin/mv "$backup" "$app"
+    /bin/launchctl bootstrap "$launch_domain" "$launch_agent" 2>/dev/null || true
     exit 4
   fi
+  /bin/launchctl bootstrap "$launch_domain" "$launch_agent"
+  /bin/launchctl kickstart -k "$launch_domain/$launch_label"
   printf '%s update-installed commit=%s backup=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$latest" "$backup"
 } >>"$log_file" 2>&1
 
-(/bin/sleep 2; /usr/bin/open "$app") >/dev/null 2>&1 &!
 json_result installed "$current" "$latest" 'DAAK NODE güncellendi; uygulama yeniden açılıyor.'
