@@ -302,6 +302,34 @@ private struct MYAL11Status: Decodable {
     let gpuTemperatureC: Double?
     let diskUsedPercent: Double?
     let services: Services
+
+    // JSONDecoder's convertFromSnakeCase preserves neither acronym spelling:
+    // `tailscale_ip` becomes `tailscaleIp` and `disk_free_kb` becomes
+    // `diskFreeKb`. Map these two required acronym fields explicitly so a
+    // valid telemetry payload does not fail as a whole.
+    enum CodingKeys: String, CodingKey {
+        case updatedAt
+        case name
+        case model
+        case tailscaleIP = "tailscaleIp"
+        case powerSource
+        case batteryPercent
+        case batteryMinutesRemaining
+        case upsState
+        case upsMessage
+        case batteryCondition
+        case batteryCycles
+        case diskFreeKB = "diskFreeKb"
+        case memoryFreePercent
+        case loadAverage
+        case uptime
+        case dockerContainersRunning
+        case cpuUsagePercent
+        case cpuTemperatureC
+        case gpuTemperatureC
+        case diskUsedPercent
+        case services
+    }
 }
 
 private struct FastDropStatus: Decodable {
