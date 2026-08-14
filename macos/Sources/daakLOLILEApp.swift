@@ -332,6 +332,48 @@ private struct MYAL11Status: Decodable {
     }
 }
 
+private struct LinuxRuntimeStatus: Decodable {
+    let displayName: String
+    let driver: String
+    let arch: String
+    let runtime: String
+    let mountType: String
+    let cpu: Int
+    let memory: Int64
+    let disk: Int64
+}
+
+private struct DockerContainerStatus: Identifiable {
+    var id: String { name }
+    let name: String
+    let image: String
+    let state: String
+    let status: String
+    let cpuPercent: String?
+    let memoryUsage: String?
+    let memoryPercent: String?
+
+    var isHealthy: Bool {
+        state == "running" && !status.localizedCaseInsensitiveContains("unhealthy")
+    }
+
+    var purpose: String {
+        switch name {
+        case "stalwart": return "Mail, IMAP, SMTP ve takvim çekirdeği"
+        case "roundcube": return "Webmail arayüzü"
+        case "mail-inbound-gateway": return "Gelen mail yönlendiricisi"
+        case "mail-public-gateway": return "Dış bağlantı geçidi"
+        case "mail-cloudflared": return "Cloudflare güvenli tüneli"
+        case "listmonk": return "Toplu mail ve otomasyon"
+        case "listmonk_db": return "Kampanya veritabanı"
+        case "mailpit": return "Güvenli test posta kutusu"
+        case "portainer": return "Konteyner yönetim paneli"
+        case "daak-adguard": return "DNS ve reklam engelleme"
+        default: return image
+        }
+    }
+}
+
 private struct FastDropStatus: Decodable {
     let updatedAt: TimeInterval
     let state: String
@@ -758,10 +800,15 @@ private final class MYAL11Monitor: ObservableObject {
     @Published private(set) var status: MYAL11Status?
     @Published private(set) var fastDrop: FastDropStatus?
     @Published private(set) var route: Route = .offline
+    @Published private(set) var linuxRuntime: LinuxRuntimeStatus?
+    @Published private(set) var containers: [DockerContainerStatus] = []
+    @Published private(set) var infrastructureError: String?
+    @Published private(set) var infrastructureUpdatedAt: Date?
     @Published private(set) var lastError: String?
     @Published private(set) var actionMessage: String?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isRunningAction = false
+    @Published private(set) var isRefreshingInfrastructure = false
 
     private let statusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/status.json"
     private let fastDropStatusPath = NSHomeDirectory() + "/Library/Application Support/DAAK/Nodes/mya-l11/fastdrop-status.json"
@@ -824,11 +871,95 @@ private final class MYAL11Monitor: ObservableObject {
             }
             evaluateUPSNotification(decoded)
             lastError = isFresh ? nil : "Son telemetri güncel değil."
+            if infrastructureUpdatedAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true {
+                await refreshInfrastructure()
+            }
         } catch {
             status = nil
             fastDrop = nil
             lastError = "MYA-L11 telemetrisi okunamadı."
         }
+    }
+
+    func refreshInfrastructure() async {
+        guard isOnline, !isRefreshingInfrastructure else { return }
+        isRefreshingInfrastructure = true
+        defer { isRefreshingInfrastructure = false }
+
+        let remoteCommand = #"""
+        export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        printf '__DAAK_LINUX__\n'
+        colima status --json 2>/dev/null || true
+        printf '__DAAK_CONTAINERS__\n'
+        docker ps --format '{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}' 2>/dev/null || true
+        printf '__DAAK_STATS__\n'
+        docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}' 2>/dev/null || true
+        """#
+        let result = await LocalCommand.run(
+            "/usr/bin/ssh",
+            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", selectedSSHHost, remoteCommand]
+        )
+        guard result.exitCode == 0 else {
+            infrastructureError = "Linux/Docker verisi alınamadı."
+            return
+        }
+
+        let linuxMarker = "__DAAK_LINUX__\n"
+        let containerMarker = "__DAAK_CONTAINERS__\n"
+        let statsMarker = "__DAAK_STATS__\n"
+        guard let linuxStart = result.output.range(of: linuxMarker)?.upperBound,
+              let containerRange = result.output.range(of: containerMarker, range: linuxStart..<result.output.endIndex),
+              let statsRange = result.output.range(of: statsMarker, range: containerRange.upperBound..<result.output.endIndex) else {
+            infrastructureError = "Linux/Docker yanıtı geçersiz."
+            return
+        }
+
+        let linuxJSON = String(result.output[linuxStart..<containerRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        linuxRuntime = try? decoder.decode(LinuxRuntimeStatus.self, from: Data(linuxJSON.utf8))
+
+        var statsByName: [String: (cpu: String, memory: String, percent: String)] = [:]
+        for line in result.output[statsRange.upperBound...].split(separator: "\n") {
+            let fields = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+            guard fields.count == 4 else { continue }
+            statsByName[fields[0]] = (fields[1], fields[2], fields[3])
+        }
+
+        containers = result.output[containerRange.upperBound..<statsRange.lowerBound]
+            .split(separator: "\n")
+            .compactMap { line in
+                let fields = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+                guard fields.count == 4 else { return nil }
+                let stats = statsByName[fields[0]]
+                return DockerContainerStatus(
+                    name: fields[0],
+                    image: fields[1],
+                    state: fields[2],
+                    status: fields[3],
+                    cpuPercent: stats?.cpu,
+                    memoryUsage: stats?.memory,
+                    memoryPercent: stats?.percent
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        infrastructureUpdatedAt = Date()
+        infrastructureError = linuxRuntime == nil ? "Colima bilgisi okunamadı." : nil
+    }
+
+    var linuxSummary: String {
+        guard let linuxRuntime else { return infrastructureError ?? "Linux verisi bekleniyor" }
+        return "\(linuxRuntime.runtime.capitalized) · \(linuxRuntime.cpu) CPU · \(ByteCountFormatter.string(fromByteCount: linuxRuntime.memory, countStyle: .memory)) RAM"
+    }
+
+    var dockerSummary: String {
+        guard !containers.isEmpty else {
+            return status.map { "\($0.dockerContainersRunning) konteyner · ayrıntılar bekleniyor" } ?? "Docker verisi bekleniyor"
+        }
+        let healthy = containers.filter(\.isHealthy).count
+        return "\(healthy)/\(containers.count) sağlıklı"
     }
 
     private static func makeCoalescedTimer(
@@ -2169,8 +2300,80 @@ private struct ServiceShortcut: View {
     }
 }
 
+private struct LinuxRuntimeCard: View {
+    let runtime: LinuxRuntimeStatus?
+    let summary: String
+    let online: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 10) {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.indigo)
+                    .frame(width: 34, height: 34)
+                    .background(Color.indigo.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Linux motoru").font(.callout.weight(.semibold))
+                    Text(summary).font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                StatusPill(online: online && runtime != nil)
+            }
+            if let runtime {
+                Divider()
+                HStack {
+                    Label("\(runtime.cpu) vCPU", systemImage: "cpu")
+                    Spacer()
+                    Label(ByteCountFormatter.string(fromByteCount: runtime.memory, countStyle: .memory), systemImage: "memorychip")
+                    Spacer()
+                    Label(ByteCountFormatter.string(fromByteCount: runtime.disk, countStyle: .file), systemImage: "internaldrive")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                Text("\(runtime.displayName) · \(runtime.driver) · \(runtime.arch) · \(runtime.mountType)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct DockerContainerRow: View {
+    let container: DockerContainerStatus
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Circle()
+                .fill(container.isHealthy ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(container.name).font(.caption.weight(.semibold))
+                Text(container.purpose).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(container.isHealthy ? "Çalışıyor" : container.status)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(container.isHealthy ? Color.green : Color.orange)
+                    .lineLimit(1)
+                if let cpu = container.cpuPercent, let memory = container.memoryUsage {
+                    Text("CPU \(cpu) · RAM \(memory.components(separatedBy: " / ").first ?? memory)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 5)
+    }
+}
+
 private struct ServerServicesView: View {
     @EnvironmentObject private var monitor: MYAL11Monitor
+    @State private var showContainers = true
 
     var body: some View {
         ScrollView {
@@ -2204,6 +2407,34 @@ private struct ServerServicesView: View {
 
                 Group {
                     Text("Linux altyapısı").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    LinuxRuntimeCard(runtime: monitor.linuxRuntime, summary: monitor.linuxSummary, online: monitor.isOnline)
+                    DisclosureGroup(isExpanded: $showContainers) {
+                        if monitor.containers.isEmpty {
+                            Text(monitor.infrastructureError ?? "Konteyner ayrıntıları bekleniyor…")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 8)
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(monitor.containers) { container in
+                                    DockerContainerRow(container: container)
+                                    if container.id != monitor.containers.last?.id { Divider() }
+                                }
+                            }
+                            .padding(.top, 5)
+                        }
+                    } label: {
+                        HStack {
+                            Label("Docker konteynerleri", systemImage: "shippingbox.fill")
+                                .font(.callout.weight(.semibold))
+                            Spacer()
+                            Text(monitor.dockerSummary)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(10)
+                    .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
                     ServiceShortcut(title: "FastDrop", detail: monitor.fastDropSummary, symbol: "arrow.left.arrow.right.circle.fill", tint: .blue, available: monitor.fastDropOnline, action: monitor.openDisk)
                     ServiceShortcut(title: "Konteyner paneli", detail: "Portainer · servisleri gör ve yönet", symbol: "shippingbox.and.arrow.backward.fill", tint: .teal, available: monitor.isOnline, action: monitor.openContainerPanel)
                     ServiceShortcut(title: "DNS ve reklam engelleme", detail: "AdGuard Home", symbol: "shield.lefthalf.filled", tint: .green, available: monitor.isOnline && (monitor.status?.services.adblock ?? true), action: monitor.openDNSPanel)
@@ -2214,7 +2445,12 @@ private struct ServerServicesView: View {
                 HStack {
                     Text(monitor.connectionSummary).font(.caption2).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Yenile") { Task { await monitor.refresh() } }
+                    Button("Yenile") {
+                        Task {
+                            await monitor.refreshInfrastructure()
+                            await monitor.refresh()
+                        }
+                    }
                         .buttonStyle(.borderless)
                         .disabled(monitor.isRefreshing)
                 }
