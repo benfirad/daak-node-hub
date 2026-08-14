@@ -1918,6 +1918,74 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
         case .node: return "S9+"
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .devices: return "square.grid.2x2.fill"
+        case .operations: return "server.rack"
+        case .lolile: return "desktopcomputer"
+        case .myaL11: return "laptopcomputer"
+        case .node: return "iphone"
+        }
+    }
+}
+
+private struct DAAKPressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .opacity(configuration.isPressed ? 0.88 : 1)
+            .animation(
+                reduceMotion ? .easeOut(duration: 0.1) : .interactiveSpring(response: 0.24, dampingFraction: 1),
+                value: configuration.isPressed
+            )
+    }
+}
+
+private struct DAAKPanelPicker: View {
+    @Binding var selection: DevicePanel
+    @Namespace private var selectionSurface
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(DevicePanel.allCases) { panel in
+                Button {
+                    guard selection != panel else { return }
+                    withAnimation(reduceMotion ? .easeOut(duration: 0.14) : .interactiveSpring(response: 0.34, dampingFraction: 1)) {
+                        selection = panel
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: panel.symbol)
+                            .font(.caption2.weight(.semibold))
+                        Text(panel.title)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(selection == panel ? Color.primary : Color.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                    .background {
+                        if selection == panel {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.regularMaterial)
+                                .matchedGeometryEffect(id: "panel-selection", in: selectionSurface)
+                                .shadow(color: .black.opacity(0.13), radius: 2, y: 1)
+                        }
+                    }
+                }
+                .buttonStyle(DAAKPressStyle())
+                .accessibilityLabel(panel.title)
+                .accessibilityAddTraits(selection == panel ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(.quaternary.opacity(0.8), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+    }
 }
 
 private struct MailAccountsView: View {
@@ -2118,7 +2186,7 @@ private struct DeviceCard: View {
                 }
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(DAAKPressStyle())
 
             HStack {
                 Text(status)
@@ -2132,7 +2200,12 @@ private struct DeviceCard: View {
             }
         }
         .padding(13)
-        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 14))
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.07), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
     }
 }
 
@@ -2829,6 +2902,8 @@ private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var mail: MailAccountMonitor
     @EnvironmentObject private var updater: UpdateMonitor
     @EnvironmentObject private var localMac: LocalMacMonitor
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var selection: DevicePanel = .devices
 
     var body: some View {
@@ -2852,33 +2927,38 @@ private struct DAAKDevicesMenuView: View {
             .padding(.top, 14)
             .padding(.bottom, 10)
 
-            Picker("Cihaz", selection: $selection) {
-                ForEach(DevicePanel.allCases) { panel in
-                    Text(panel.title).tag(panel)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            DAAKPanelPicker(selection: $selection)
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
 
             Divider()
 
-            switch selection {
-            case .devices:
-                DeviceOverviewView(selection: $selection)
-            case .operations:
-                OperationsView()
-            case .lolile:
-                ScrollView {
-                    RelayMenuView()
+            ZStack {
+                switch selection {
+                case .devices:
+                    DeviceOverviewView(selection: $selection)
+                case .operations:
+                    OperationsView()
+                case .lolile:
+                    ScrollView {
+                        RelayMenuView()
+                    }
+                    .frame(maxHeight: 690)
+                case .myaL11:
+                    MYAL11MenuView()
+                case .node:
+                    NodeMenuView()
                 }
-                .frame(maxHeight: 690)
-            case .myaL11:
-                MYAL11MenuView()
-            case .node:
-                NodeMenuView()
             }
+            .id(selection)
+            .transition(reduceMotion ? .opacity : .asymmetric(
+                insertion: .opacity.combined(with: .scale(scale: 0.985, anchor: .top)),
+                removal: .opacity
+            ))
+            .animation(
+                reduceMotion ? .easeOut(duration: 0.14) : .interactiveSpring(response: 0.34, dampingFraction: 1),
+                value: selection
+            )
 
             Divider()
 
@@ -2908,6 +2988,7 @@ private struct DAAKDevicesMenuView: View {
             .padding(.vertical, 9)
         }
         .frame(width: 460)
+        .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.ultraThinMaterial))
         .onReceive(node.$location) { location in
             separation.updatePhoneLocation(location)
         }
