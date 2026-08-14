@@ -857,7 +857,19 @@ private final class MYAL11Monitor: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
 
+        // Render the latest mirrored telemetry immediately. Route probing may
+        // take a few seconds and must not leave an old AC/UPS state on screen.
+        reloadCachedTelemetry()
         await refreshRoute()
+
+        guard status != nil else { return }
+        lastError = isFresh ? nil : "Son telemetri güncel değil."
+        if infrastructureUpdatedAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true {
+            await refreshInfrastructure()
+        }
+    }
+
+    func reloadCachedTelemetry() {
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: statusPath))
             let decoder = JSONDecoder()
@@ -872,9 +884,6 @@ private final class MYAL11Monitor: ObservableObject {
             }
             evaluateUPSNotification(decoded)
             lastError = isFresh ? nil : "Son telemetri güncel değil."
-            if infrastructureUpdatedAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true {
-                await refreshInfrastructure()
-            }
         } catch {
             status = nil
             fastDrop = nil
@@ -3379,6 +3388,11 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             popover.performClose(sender)
             return
         }
+
+        // The sync agent writes this tiny local JSON independently of the UI.
+        // Reload it before drawing so power changes never wait for the timer.
+        myaL11.reloadCachedTelemetry()
+        Task { await myaL11.refresh() }
 
         // NSPopover is physically anchored to the status item. This keeps the
         // panel directly below the DAAK icon even when menu-bar items move.
