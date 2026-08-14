@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import Foundation
 @preconcurrency import CoreLocation
 import UserNotifications
@@ -3246,31 +3247,77 @@ private struct RelayMenuView: View {
     }
 }
 
+@MainActor
+private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
+    private let relay = RelayMonitor()
+    private let node = NodeMonitor()
+    private let myaL11 = MYAL11Monitor()
+    private let separation = SeparationMonitor()
+    private let mail = MailAccountMonitor()
+    private let updater = UpdateMonitor()
+    private let localMac = LocalMacMonitor()
+
+    private let popover = NSPopover()
+    private var statusItem: NSStatusItem?
+    private var subscriptions = Set<AnyCancellable>()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let rootView = DAAKDevicesMenuView()
+            .environmentObject(relay)
+            .environmentObject(node)
+            .environmentObject(myaL11)
+            .environmentObject(separation)
+            .environmentObject(mail)
+            .environmentObject(updater)
+            .environmentObject(localMac)
+
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 460, height: 720)
+        popover.contentViewController = NSHostingController(rootView: rootView)
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = item
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.sendAction(on: [.leftMouseUp])
+            button.toolTip = "DAAK NODE cihaz merkezi"
+            button.setAccessibilityLabel("DAAK NODE cihaz merkezi")
+        }
+        updateStatusIcon()
+
+        myaL11.$status
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &subscriptions)
+    }
+
+    @objc private func togglePopover(_ sender: NSStatusBarButton) {
+        if popover.isShown {
+            popover.performClose(sender)
+            return
+        }
+
+        // NSPopover is physically anchored to the status item. This keeps the
+        // panel directly below the DAAK icon even when menu-bar items move.
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func updateStatusIcon() {
+        let symbol = myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "circle.grid.2x2.fill"
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "DAAK NODE cihaz merkezi")
+        image?.isTemplate = true
+        statusItem?.button?.image = image
+    }
+}
+
 @main
 struct daakLOLILEApp: App {
-    @StateObject private var relay = RelayMonitor()
-    @StateObject private var node = NodeMonitor()
-    @StateObject private var myaL11 = MYAL11Monitor()
-    @StateObject private var separation = SeparationMonitor()
-    @StateObject private var mail = MailAccountMonitor()
-    @StateObject private var updater = UpdateMonitor()
-    @StateObject private var localMac = LocalMacMonitor()
+    @NSApplicationDelegateAdaptor(DAAKStatusBarController.self) private var statusBarController
 
     var body: some Scene {
-        MenuBarExtra {
-            DAAKDevicesMenuView()
-                .environmentObject(relay)
-                .environmentObject(node)
-                .environmentObject(myaL11)
-                .environmentObject(separation)
-                .environmentObject(mail)
-                .environmentObject(updater)
-                .environmentObject(localMac)
-        } label: {
-            Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "circle.grid.2x2.fill")
-                .symbolRenderingMode(.hierarchical)
-            .accessibilityLabel("DAAK NODE cihaz merkezi")
-        }
-        .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
     }
 }
