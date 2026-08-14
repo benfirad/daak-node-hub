@@ -3397,7 +3397,31 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
         // NSPopover is physically anchored to the status item. This keeps the
         // panel directly below the DAAK icon even when menu-bar items move.
         popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        DispatchQueue.main.async { [weak self, weak sender] in
+            guard let self, let sender else { return }
+            self.reanchorPopoverIfNeeded(to: sender)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak sender] in
+            guard let self, let sender else { return }
+            self.reanchorPopoverIfNeeded(to: sender)
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func reanchorPopoverIfNeeded(to sender: NSStatusBarButton) {
+        guard popover.isShown,
+              let buttonWindow = sender.window,
+              let popoverWindow = popover.contentViewController?.view.window else { return }
+
+        let buttonRectInWindow = sender.convert(sender.bounds, to: nil)
+        let buttonRectOnScreen = buttonWindow.convertToScreen(buttonRectInWindow)
+        let horizontalDrift = abs(popoverWindow.frame.midX - buttonRectOnScreen.midX)
+        guard horizontalDrift > 2 else { return }
+
+        // Menu-bar items can be reflowed immediately after launch. Showing an
+        // already-visible NSPopover again updates its positioning association
+        // without closing it or interrupting the user's interaction.
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
     }
 
     private func updateStatusIcon() {
