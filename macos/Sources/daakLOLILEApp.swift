@@ -1112,7 +1112,9 @@ private final class MYAL11Monitor: ObservableObject {
 
     func openWebmail() { openURL(configuration?.webmailURL) }
     func openMailAdmin() { openURL(configuration?.mailAdminURL) }
-    func openCampaigns() { openURL(configuration?.campaignsURL) }
+    func openCampaigns() {
+        Task { await openCampaignsSecurely() }
+    }
     func openMailPreview() { openURL(configuration?.mailPreviewURL) }
     func openContainerPanel() { openURL(configuration?.containerPanelURL) }
     func openDNSPanel() { openURL(configuration?.dnsPanelURL) }
@@ -1134,6 +1136,66 @@ private final class MYAL11Monitor: ObservableObject {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    private func openCampaignsSecurely() async {
+        guard let value = configuration?.campaignsURL,
+              let remoteURL = URL(string: value) else {
+            actionMessage = "Kampanya servisi için node-config.json ayarı gerekli."
+            return
+        }
+
+        // Public campaign URLs should open normally. The private MYA-L11 URL is
+        // deliberately kept on loopback and reached through an on-demand SSH
+        // tunnel so Listmonk is never exposed to the LAN or the internet.
+        guard remoteURL.host == configuration?.tailHost else {
+            openURL(value)
+            return
+        }
+
+        let remotePort = remoteURL.port ?? (remoteURL.scheme == "https" ? 443 : 80)
+        guard (1...65_535).contains(remotePort) else {
+            actionMessage = "Kampanya servisi port ayarı geçerli değil."
+            return
+        }
+
+        let localPort = 39_000
+        let localURL = "http://127.0.0.1:\(localPort)/"
+        if await campaignTunnelIsReady(localURL) {
+            openURL(localURL)
+            return
+        }
+
+        let tunnel = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-f", "-N",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ExitOnForwardFailure=yes",
+                "-L", "127.0.0.1:\(localPort):127.0.0.1:\(remotePort)",
+                "mya-l11-tail"
+            ]
+        )
+        guard tunnel.exitCode == 0 else {
+            actionMessage = "Kampanya paneli için güvenli tünel açılamadı."
+            return
+        }
+
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        guard await campaignTunnelIsReady(localURL) else {
+            actionMessage = "Kampanya paneli tünele rağmen yanıt vermedi."
+            return
+        }
+        openURL(localURL)
+    }
+
+    private func campaignTunnelIsReady(_ localURL: String) async -> Bool {
+        let result = await LocalCommand.run(
+            "/usr/bin/curl",
+            ["-fsS", "--max-time", "3", "--output", "/dev/null", localURL]
+        )
+        return result.exitCode == 0
     }
 
     func power(_ action: String) async {
