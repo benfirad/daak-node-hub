@@ -33,7 +33,18 @@ cat > "$launch_agent" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>app.daaknode.system-ui</string>
-  <key>ProgramArguments</key><array><string>/Applications/daakLOLILE.app/Contents/MacOS/daakLOLILE</string></array>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=$HOME</string>
+    <string>USER=$(/usr/bin/id -un)</string>
+    <string>LOGNAME=$(/usr/bin/id -un)</string>
+    <string>PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>ADB=/opt/homebrew/bin/adb</string>
+    <string>LANG=en_US.UTF-8</string>
+    <string>TMPDIR=/tmp</string>
+    <string>/Applications/daakLOLILE.app/Contents/MacOS/daakLOLILE</string>
+  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>

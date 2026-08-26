@@ -494,19 +494,37 @@ private struct MailCredential: Decodable {
 }
 
 private enum LocalCommand {
+    private static var environment: [String: String] {
+        let inherited = ProcessInfo.processInfo.environment
+        var value: [String: String] = [
+            "HOME": NSHomeDirectory(),
+            "USER": NSUserName(),
+            "LOGNAME": NSUserName(),
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "ADB": "/opt/homebrew/bin/adb",
+            "LANG": inherited["LANG"] ?? "en_US.UTF-8",
+            "TMPDIR": inherited["TMPDIR"] ?? "/tmp"
+        ]
+        if let socket = inherited["SSH_AUTH_SOCK"], !socket.isEmpty {
+            value["SSH_AUTH_SOCK"] = socket
+        }
+        return value
+    }
+
     static func run(_ executable: String, _ arguments: [String]) async -> CommandResult {
         await Task.detached(priority: .utility) {
             let process = Process()
             let pipe = Pipe()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
+            process.environment = environment
             process.standardOutput = pipe
             process.standardError = pipe
 
             do {
                 try process.run()
-                process.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 return CommandResult(
                     exitCode: process.terminationStatus,
                     output: String(decoding: data, as: UTF8.self)
@@ -522,6 +540,7 @@ private enum LocalCommand {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.environment = environment
         try process.run()
     }
 
@@ -532,6 +551,7 @@ private enum LocalCommand {
             let stdin = Pipe()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
+            process.environment = environment
             process.standardOutput = output
             process.standardError = output
             process.standardInput = stdin
@@ -539,10 +559,11 @@ private enum LocalCommand {
                 try process.run()
                 stdin.fileHandleForWriting.write(Data(input.utf8))
                 try? stdin.fileHandleForWriting.close()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 return CommandResult(
                     exitCode: process.terminationStatus,
-                    output: String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    output: String(decoding: data, as: UTF8.self)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                 )
             } catch {
@@ -631,6 +652,9 @@ private final class UpdateMonitor: ObservableObject {
                 NSApplication.shared.terminate(nil)
             }
         case "busy": state = "Güncelleniyor"
+        case "held":
+            state = "Yerel sürüm korundu"
+            updateAvailable = false
         default: state = "Hata"
         }
 
@@ -1262,7 +1286,7 @@ private final class NodeMonitor: ObservableObject {
               let data = result.output.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(NodeStatus.self, from: data) else {
             status = nil
-            lastError = "S9’a ulaşılamadı. Tailscale ve Termux SSH bağlantısını kontrol et."
+            lastError = "Vaytniga’ya ulaşılamadı. Tailscale ve Termux SSH bağlantısını kontrol et."
             return
         }
         status = decoded
@@ -1326,10 +1350,10 @@ private final class NodeMonitor: ObservableObject {
         await refreshExitNodeState()
         if result.exitCode == 0 {
             actionMessage = enabled
-                ? "Mac interneti artık S9 üzerinden çıkıyor."
+                ? "Mac interneti artık Vaytniga üzerinden çıkıyor."
                 : "Mac normal internet rotasına döndü."
         } else {
-            actionMessage = "S9 çıkış rotası değiştirilemedi: \(result.output)"
+            actionMessage = "Vaytniga çıkış rotası değiştirilemedi: \(result.output)"
         }
     }
 
@@ -1384,7 +1408,7 @@ private final class NodeMonitor: ObservableObject {
 
     func openLiveScreen() async {
         guard Self.isSafeHost(host) else { return }
-        actionMessage = "S9 ekranına bağlanılıyor…"
+        actionMessage = "Vaytniga ekranına bağlanılıyor…"
         let serial = "\(host):\(adbPort)"
         let adb = await LocalCommand.run("/opt/homebrew/bin/adb", ["connect", serial])
         guard adb.exitCode == 0 else {
@@ -1394,7 +1418,7 @@ private final class NodeMonitor: ObservableObject {
         do {
             try LocalCommand.launch(
                 "/opt/homebrew/bin/scrcpy",
-                ["--serial", serial, "--no-audio", "--stay-awake", "--window-title", "DAAK NODE · Galaxy S9+"]
+                ["--serial", serial, "--no-audio", "--stay-awake", "--window-title", "DAAK NODE · Vaytniga"]
             )
             actionMessage = "Canlı ekran açıldı."
         } catch {
@@ -1405,7 +1429,7 @@ private final class NodeMonitor: ObservableObject {
     func openSSH() {
         guard Self.isSafeHost(host), let url = URL(string: "ssh://\(host):\(sshPort)") else { return }
         NSWorkspace.shared.open(url)
-        actionMessage = "S9 terminali açılıyor."
+        actionMessage = "Vaytniga terminali açılıyor."
     }
 
     private func sshArguments(remoteCommand: String) -> [String] {
@@ -1572,7 +1596,7 @@ private final class SeparationMonitor: NSObject, ObservableObject, @preconcurren
     private func sendAwayNotification(distance: Double) {
         let content = UNMutableNotificationContent()
         content.title = "DAAK NODE senden uzaklaştı"
-        content.body = "Galaxy S9+ yaklaşık \(Self.distanceText(distance)) uzakta. Son konumu DAAK NODE menüsünden açabilirsin."
+        content.body = "Vaytniga yaklaşık \(Self.distanceText(distance)) uzakta. Son konumu DAAK NODE menüsünden açabilirsin."
         content.sound = .default
         let request = UNNotificationRequest(
             identifier: "app.daaknode.phone-separated",
@@ -1924,7 +1948,7 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
         case .operations: return "Servisler"
         case .lolile: return "LOLİLE"
         case .myaL11: return "MYA-L11"
-        case .node: return "S9+"
+        case .node: return "Vaytniga"
         }
     }
 
@@ -2293,7 +2317,7 @@ private struct DeviceOverviewView: View {
 
             DeviceCard(
                 name: "DAAK NODE",
-                detail: "Galaxy S9+ · Find · SSH · Canlı ekran",
+                detail: "Vaytniga · Find · SSH · Canlı ekran",
                 symbol: "iphone",
                 online: node.isOnline,
                 status: node.healthSummary,
@@ -2735,7 +2759,7 @@ private struct NodeMenuView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("DAAK NODE")
                         .font(.headline)
-                    Text("Galaxy S9+ · özel Tailscale hattı")
+                    Text("Vaytniga · özel Tailscale hattı")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -2832,7 +2856,7 @@ private struct NodeMenuView: View {
                 Task { await node.setPhoneExitNode(enabled: !node.isUsingPhoneExitNode) }
             } label: {
                 Label(
-                    node.isUsingPhoneExitNode ? "S9 çıkışını kapat" : "Mac’i S9 üzerinden çıkar",
+                    node.isUsingPhoneExitNode ? "Vaytniga çıkışını kapat" : "Mac’i Vaytniga üzerinden çıkar",
                     systemImage: node.isUsingPhoneExitNode ? "network.slash" : "shield.lefthalf.filled"
                 )
             }
@@ -2864,7 +2888,7 @@ private struct NodeMenuView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 7) {
-                Text("S9+ · Tailscale IP")
+                Text("Vaytniga · Tailscale IP")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {

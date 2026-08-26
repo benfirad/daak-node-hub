@@ -4,7 +4,7 @@ set -euo pipefail
 repository='https://github.com/benfirad/daak-node-hub.git'
 archive_base='https://codeload.github.com/benfirad/daak-node-hub/tar.gz'
 branch='main'
-app='/Applications/daakLOLILE.app'
+app="${DAAK_NODE_APP_PATH:-/Applications/daakLOLILE.app}"
 state_dir="$HOME/Library/Application Support/DAAK/Updater"
 cache_dir="$HOME/Library/Caches/DAAKNodeHub"
 log_file="$HOME/Library/Logs/daak-node-updater.log"
@@ -21,8 +21,12 @@ PY
 }
 
 current='unknown'
+current_version='unknown'
+current_build='0'
 if [[ -r "$app/Contents/Info.plist" ]]; then
   current="$(/usr/libexec/PlistBuddy -c 'Print :DAAKSourceCommit' "$app/Contents/Info.plist" 2>/dev/null || printf unknown)"
+  current_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || printf unknown)"
+  current_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" 2>/dev/null || printf 0)"
 fi
 
 latest="$(/usr/bin/python3 - "$repository" "$branch" "$log_file" <<'PY'
@@ -54,6 +58,41 @@ fi
 
 if [[ "$current" == "$latest" ]]; then
   json_result current "$current" "$latest" 'DAAK NODE güncel.'
+  exit 0
+fi
+
+remote_metadata="$(/usr/bin/python3 - "$latest" "$log_file" <<'PY'
+import plistlib, sys, urllib.request
+
+url = f"https://raw.githubusercontent.com/benfirad/daak-node-hub/{sys.argv[1]}/macos/Info.plist"
+try:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        info = plistlib.load(response)
+    print(f"{info.get('CFBundleShortVersionString', 'unknown')}\t{info.get('CFBundleVersion', '0')}")
+except Exception as exc:
+    with open(sys.argv[2], "a", encoding="utf-8") as log:
+        log.write(f"Remote version metadata failed: {type(exc).__name__}\n")
+PY
+)"
+remote_version="${remote_metadata%%$'\t'*}"
+remote_build="${remote_metadata#*$'\t'}"
+if [[ -z "$remote_metadata" || "$remote_version" == unknown ]]; then
+  json_result error "$current" "$latest" 'GitHub paket sürümü doğrulanamadı; güvenlik için otomatik kurulum durduruldu.'
+  exit 2
+fi
+
+if [[ "$current_version" != unknown ]] && /usr/bin/python3 - "$current_version" "$current_build" "$remote_version" "$remote_build" <<'PY'
+import re, sys
+
+def version(value):
+    return tuple(int(part) for part in re.findall(r"\d+", value))
+
+current = (version(sys.argv[1]), version(sys.argv[2]))
+remote = (version(sys.argv[3]), version(sys.argv[4]))
+raise SystemExit(0 if current > remote else 1)
+PY
+then
+  json_result held "$current" "$latest" "Yerel DAAK NODE v$current_version ($current_build), GitHub v$remote_version ($remote_build) sürümünden daha yeni; otomatik geriye dönüş engellendi."
   exit 0
 fi
 

@@ -15,9 +15,9 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.6.2</string>
+	<string>2.9.1</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>10</string>
 	<key>DAAKSourceCommit</key>
 	<string>development</string>
 	<key>DAAKUpdateChannel</key>
@@ -29,9 +29,9 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>DAAK NODE uses your private Tailscale network to reach your Windows PC and Galaxy S9+.</string>
+  <string>DAAK NODE uses your private Tailscale network to reach LOLILE, the Intel Mac server, and Vaytniga.</string>
   <key>NSLocationWhenInUseUsageDescription</key>
-  <string>DAAK NODE compares this Mac's location with your Galaxy S9+ to warn when the phone is left behind.</string>
+  <string>DAAK NODE compares this Mac's location with Vaytniga to warn when the phone is left behind.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsArbitraryLoads</key>
