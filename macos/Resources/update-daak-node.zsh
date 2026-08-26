@@ -67,7 +67,7 @@ import plistlib, sys, urllib.request
 url = f"https://raw.githubusercontent.com/benfirad/daak-node-hub/{sys.argv[1]}/macos/Info.plist"
 try:
     with urllib.request.urlopen(url, timeout=20) as response:
-        info = plistlib.load(response)
+        info = plistlib.loads(response.read())
     print(f"{info.get('CFBundleShortVersionString', 'unknown')}\t{info.get('CFBundleVersion', '0')}")
 except Exception as exc:
     with open(sys.argv[2], "a", encoding="utf-8") as log:
