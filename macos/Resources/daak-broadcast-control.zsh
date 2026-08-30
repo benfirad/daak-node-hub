@@ -38,6 +38,8 @@ PY
 
 DIRECT_HOST="${DAAK_BROADCAST_DIRECT_HOST:-$(configured_host thunderboltHost 2>/dev/null || true)}"
 TAIL_HOST="${DAAK_BROADCAST_TAIL_HOST:-$(configured_host tailHost 2>/dev/null || true)}"
+DIRECT_SSH_HOST="${DAAK_BROADCAST_DIRECT_SSH_HOST:-mya-l11-thunderbolt}"
+TAIL_SSH_HOST="${DAAK_BROADCAST_TAIL_SSH_HOST:-mya-l11-tail}"
 
 sync_camera_script() {
   local source="${0:A:h}/create_m3_scene.lua"
@@ -476,11 +478,24 @@ set_quality() {
   print -r -- "{\"quality\":\"$selected\"}"
 }
 
-ssh_host() {
-  # Control traffic stays on the already-trusted Tailnet SSH alias. Media uses
-  # Thunderbolt when available, so a stale direct-link SSH host key can never
-  # block or weaken the broadcast control path.
-  print -r -- mya-l11-tail
+receiver_request() {
+  local selected="$1" command="$2" host output
+  local -a hosts
+  if [[ "$selected" == direct ]]; then
+    # Keep control traffic on the same low-latency link as media. Tailscale is
+    # retained as an automatic fallback for a stale direct-link SSH session.
+    hosts=("$DIRECT_SSH_HOST" "$TAIL_SSH_HOST")
+  else
+    hosts=("$TAIL_SSH_HOST")
+  fi
+  for host in "${hosts[@]}"; do
+    if output="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" \
+      "$RECEIVER_COMMAND $command" 2>/dev/null)"; then
+      print -r -- "$output"
+      return 0
+    fi
+  done
+  return 1
 }
 
 running_pid() {
@@ -569,7 +584,7 @@ PY
 }
 
 status() {
-  local selected sender receiver="unknown" quality effective layout vertical capture_mode studio=false cameras=false privacy=false
+  local selected sender receiver quality effective layout vertical capture_mode studio=false cameras=false privacy=false
   selected="$(route)"
   quality="$(quality_selection)"
   layout="$(layout_selection)"
@@ -582,8 +597,7 @@ status() {
   camera_ready && cameras=true
   capture_ready && privacy=true
   if [[ "$selected" != offline ]]; then
-    receiver="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 "$(ssh_host "$selected")" \
-      "$RECEIVER_COMMAND status" 2>/dev/null || print -r -- '{"state":"unknown"}')"
+    receiver="$(receiver_request "$selected" status || print -r -- '{"state":"unreachable"}')"
   else
     receiver='{"state":"offline"}'
   fi
@@ -591,9 +605,9 @@ status() {
 import json, sys, time
 route, sender, receiver_raw, quality, effective, layout, vertical, capture_mode, studio, cameras, privacy, config_path = sys.argv[1:]
 try:
-    receiver = json.loads(receiver_raw).get("state", "unknown")
+    receiver = json.loads(receiver_raw).get("state", "unreachable")
 except Exception:
-    receiver = "unknown"
+    receiver = "unreachable"
 window_id = None
 window_owner = None
 try:
@@ -630,8 +644,7 @@ PY
 }
 
 start_split() {
-  local selected="$1" remote profile pid="" quality effective layout
-  remote="$(ssh_host "$selected")"
+  local selected="$1" profile pid="" quality effective layout
   quality="$(quality_selection)"
   layout="$(layout_selection)"
   effective="$quality"
@@ -657,8 +670,7 @@ start_split() {
     fi
     return 1
   }
-  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
-    "$RECEIVER_COMMAND start $effective" >/dev/null
+  receiver_request "$selected" "start $effective" >/dev/null
   if [[ "$selected" == tailscale ]]; then
     start_relay "$selected"
   else
@@ -714,8 +726,7 @@ stop_all() {
   /bin/rm -f "$RELAY_PID_FILE"
   selected="$(route)"
   if [[ "$selected" != offline ]]; then
-    /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=4 "$(ssh_host "$selected")" \
-      "$RECEIVER_COMMAND stop" >/dev/null 2>&1 || true
+    receiver_request "$selected" stop >/dev/null 2>&1 || true
   fi
   write_state stopped "$selected" "DAAK yayın süreçleri durduruldu."
   print -r -- "{\"state\":\"stopped\",\"route\":\"$selected\"}"

@@ -2770,6 +2770,9 @@ private final class BroadcastMonitor: ObservableObject {
                 : "Önce yalnız yayında görünecek güvenli pencereyi seç."
         }
         if value.route == "offline" { return "Intel erişilemiyor; yerel OBS kullanılabilir." }
+        if value.receiver == "unreachable" || value.receiver == "unknown" {
+            return "Intel yayın denetleyicisine ulaşılamadı; Thunderbolt ve Tailscale yeniden denenecek."
+        }
         if value.receiver == "idle" { return "Intel alıcısı henüz hazır değil." }
         if value.receiver == "receiving" { return "Intel alıyor ve VideoToolbox ile işliyor." }
         if value.receiver == "listening" { return "Intel alıcı hazır; yayın başlatılabilir." }
@@ -2977,6 +2980,8 @@ private struct BroadcastView: View {
         case "receiving": return "Alıyor"
         case "idle": return "Beklemede"
         case "stopped": return "Kapalı"
+        case "unreachable", "unknown": return "Erişilemiyor"
+        case "offline": return "Çevrimdışı"
         default: return value.capitalized
         }
     }
