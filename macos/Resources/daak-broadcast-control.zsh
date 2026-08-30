@@ -7,6 +7,7 @@ RELAY_PID_FILE="$ROOT/m3-srt-relay.pid"
 STATE_FILE="$ROOT/state.json"
 QUALITY_FILE="$ROOT/quality-profile"
 LAYOUT_FILE="$ROOT/layout-profile"
+VERTICAL_LAYOUT_FILE="$ROOT/vertical-layout-profile"
 CAMERA_CONFIG="$ROOT/camera-sources.conf"
 CAMERA_SCRIPT="$ROOT/scripts/create_m3_scene.lua"
 OBS_PROFILE="$HOME/Library/Application Support/obs-studio/basic/profiles/DAAK Sender Thunderbolt/basic.ini"
@@ -91,6 +92,221 @@ layout_scene() {
     mac) print -r -- "DAAK M3 Kamera Tam" ;;
     *) print -r -- "DAAK Ekran + Kameralar" ;;
   esac
+}
+
+vertical_layout_selection() {
+  local selected="screen-phone"
+  [[ -f "$VERTICAL_LAYOUT_FILE" ]] && selected="$(<"$VERTICAL_LAYOUT_FILE")"
+  case "$selected" in
+    screen-phone|screen-mac|triple) print -r -- "$selected" ;;
+    *) print -r -- screen-phone ;;
+  esac
+}
+
+any_obs_running() {
+  /usr/bin/pgrep -x OBS >/dev/null 2>&1
+}
+
+set_vertical_layout() {
+  local requested="${1:-}" temporary
+  case "$requested" in
+    screen-phone|screen-mac|triple) ;;
+    *) print -u2 -- "vertical layout must be screen-phone, screen-mac, or triple"; return 64 ;;
+  esac
+  any_obs_running && {
+    print -u2 -- "OBS'yi kapatıp dikey düzeni tekrar seç"
+    return 1
+  }
+  /bin/mkdir -p "$ROOT"
+  temporary="$VERTICAL_LAYOUT_FILE.$$"
+  print -r -- "$requested" > "$temporary"
+  /bin/mv "$temporary" "$VERTICAL_LAYOUT_FILE"
+  write_state stopped "$(route)" "Dikey yayın düzeni $requested olarak ayarlandı."
+  print -r -- "{\"verticalLayout\":\"$requested\"}"
+}
+
+set_capture_window() {
+  local window_id="${1:-}" owner="${2:-}" title="${3:-}"
+  any_obs_running && {
+    print -u2 -- "OBS'yi kapatıp güvenli yayın penceresini tekrar seç"
+    return 1
+  }
+  /bin/mkdir -p "$ROOT"
+  /usr/bin/python3 - "$CAMERA_CONFIG" "$window_id" "$owner" "$title" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+try:
+    window_id = int(sys.argv[2])
+except ValueError:
+    raise SystemExit("window id must be numeric")
+owner = sys.argv[3].replace("\r", " ").replace("\n", " ").strip()
+title = sys.argv[4].replace("\r", " ").replace("\n", " ").strip()
+if not 0 < window_id <= 0xFFFFFFFF or not owner or not title:
+    raise SystemExit("a visible named window must be selected")
+if len(owner) > 200 or len(title) > 500:
+    raise SystemExit("window label is too long")
+
+values = {}
+order = []
+if path.is_file():
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key and key not in values:
+            values[key] = value
+            order.append(key)
+values.update({
+    "capture_window_id": str(window_id),
+    "capture_window_owner": owner,
+    "capture_window_title": title,
+})
+for key in ("capture_window_id", "capture_window_owner", "capture_window_title"):
+    if key not in order:
+        order.append(key)
+
+fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        for key in order:
+            handle.write(f"{key}={values[key]}\n")
+    if path.exists():
+        os.chmod(temporary, path.stat().st_mode)
+    os.replace(temporary, path)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+PY
+  apply_privacy_capture
+  write_state stopped "$(route)" "Güvenli pencere yakalama hedefi ayarlandı."
+  print -r -- "{\"captureWindowID\":$window_id}"
+}
+
+clear_capture_window() {
+  any_obs_running && {
+    print -u2 -- "OBS'yi kapatıp güvenli yayın penceresini tekrar temizle"
+    return 1
+  }
+  /usr/bin/python3 - "$CAMERA_CONFIG" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+lines = []
+if path.is_file():
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith(("capture_window_id=", "capture_window_owner=", "capture_window_title=")):
+            lines.append(line)
+fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        if lines:
+            handle.write("\n".join(lines) + "\n")
+    if path.exists():
+        os.chmod(temporary, path.stat().st_mode)
+    os.replace(temporary, path)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+PY
+  apply_privacy_capture 2>/dev/null || true
+  write_state stopped "$(route)" "Güvenli yayın penceresi seçimi temizlendi."
+  print -r -- '{"captureWindowID":null}'
+}
+
+apply_privacy_capture() {
+  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+config_path, scene_path = map(Path, sys.argv[1:])
+values = {}
+if config_path.is_file():
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+try:
+    window_id = int(values.get("capture_window_id", "0"))
+except ValueError:
+    window_id = 0
+configured = window_id > 0 and values.get("capture_window_owner") and values.get("capture_window_title")
+if not configured:
+    window_id = 0
+if not scene_path.is_file():
+    raise SystemExit("OBS yayın sahnesi bulunamadı")
+
+scene = json.loads(scene_path.read_text(encoding="utf-8"))
+capture = next((source for source in scene.get("sources", []) if source.get("name") == "M3 Ekran ve Ses"), None)
+if capture is None:
+    raise SystemExit("OBS güvenli pencere kaynağı bulunamadı")
+settings = capture.setdefault("settings", {})
+settings.update({
+    "type": 1,
+    "window": window_id,
+    "show_cursor": True,
+    "hide_obs": True,
+    "show_empty_names": False,
+    "show_hidden_windows": True,
+})
+settings.pop("display_uuid", None)
+
+fd, temporary = tempfile.mkstemp(prefix=scene_path.name + ".", suffix=".tmp", dir=scene_path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(scene, handle, ensure_ascii=False, indent=4)
+        handle.write("\n")
+    os.chmod(temporary, scene_path.stat().st_mode)
+    os.replace(temporary, scene_path)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+if not configured:
+    raise SystemExit("Önce DAAK Node'dan güvenli yayın penceresini seç.")
+PY
+}
+
+privacy_ready() {
+  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+config_path, scene_path = map(Path, sys.argv[1:])
+values = {}
+try:
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    window_id = int(values.get("capture_window_id", "0"))
+    scene = json.loads(scene_path.read_text(encoding="utf-8"))
+    capture = next(source for source in scene.get("sources", []) if source.get("name") == "M3 Ekran ve Ses")
+    settings = capture.get("settings", {})
+except (OSError, ValueError, StopIteration, json.JSONDecodeError):
+    raise SystemExit(1)
+if (window_id > 0 and values.get("capture_window_owner") and values.get("capture_window_title")
+        and settings.get("type") == 1 and int(settings.get("window", 0)) > 0
+        and not settings.get("display_uuid")):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 set_layout() {
@@ -300,28 +516,43 @@ PY
 }
 
 status() {
-  local selected sender receiver="unknown" quality effective layout studio=false cameras=false
+  local selected sender receiver="unknown" quality effective layout vertical studio=false cameras=false privacy=false
   selected="$(route)"
   quality="$(quality_selection)"
   layout="$(layout_selection)"
+  vertical="$(vertical_layout_selection)"
   effective="$quality"
   [[ "$selected" == tailscale ]] && effective=1080p30
   sender="$(sender_state)"
   studio_ready && studio=true
   camera_ready && cameras=true
+  privacy_ready && privacy=true
   if [[ "$selected" != offline ]]; then
     receiver="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 "$(ssh_host "$selected")" \
       "$RECEIVER_COMMAND status" 2>/dev/null || print -r -- '{"state":"unknown"}')"
   else
     receiver='{"state":"offline"}'
   fi
-  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" "$layout" "$studio" "$cameras" <<'PY'
+  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" "$layout" "$vertical" "$studio" "$cameras" "$privacy" "$CAMERA_CONFIG" <<'PY'
 import json, sys, time
-route, sender, receiver_raw, quality, effective, layout, studio, cameras = sys.argv[1:]
+route, sender, receiver_raw, quality, effective, layout, vertical, studio, cameras, privacy, config_path = sys.argv[1:]
 try:
     receiver = json.loads(receiver_raw).get("state", "unknown")
 except Exception:
     receiver = "unknown"
+window_id = None
+window_owner = None
+try:
+    values = {}
+    with open(config_path, encoding="utf-8") as handle:
+        for line in handle:
+            key, separator, value = line.rstrip("\n").partition("=")
+            if separator:
+                values[key] = value
+    window_id = int(values.get("capture_window_id", "0")) or None
+    window_owner = values.get("capture_window_owner") or None
+except (OSError, ValueError):
+    pass
 print(json.dumps({
     "schema": 1,
     "route": route,
@@ -332,8 +563,12 @@ print(json.dumps({
     "quality": quality,
     "effectiveQuality": effective,
     "layout": layout,
+    "verticalLayout": vertical,
     "studioReady": studio == "true",
     "cameraReady": cameras == "true",
+    "privacyReady": privacy == "true",
+    "captureWindowID": window_id,
+    "captureWindowOwner": window_owner,
     "updatedAt": time.time()
 }, separators=(",", ":")))
 PY
@@ -353,6 +588,15 @@ start_split() {
     apply_direct_quality "$quality"
   fi
   sync_camera_script
+  if ! apply_privacy_capture; then
+    write_state blocked "$selected" "Güvenli pencere seçilmeden yayın başlatılmadı."
+    return 1
+  fi
+  privacy_ready || {
+    write_state blocked "$selected" "Güvenli pencere seçilmeden yayın başlatılmadı."
+    print -u2 -- "Önce DAAK Node'dan güvenli yayın penceresini seç."
+    return 1
+  }
   /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
     "$RECEIVER_COMMAND start $effective" >/dev/null
   if [[ "$selected" == tailscale ]]; then
@@ -419,6 +663,7 @@ stop_all() {
 
 start_local() {
   sync_camera_script
+  apply_privacy_capture 2>/dev/null || true
   /usr/bin/open -a /Applications/OBS.app
   write_state local offline "Intel erişilemiyor; yerel OBS açıldı."
   print -r -- '{"state":"local","route":"offline"}'
@@ -446,5 +691,20 @@ case "${1:-status}" in
       print -r -- "{\"layout\":\"$(layout_selection)\"}"
     fi
     ;;
-  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]|layout [screen|studio|phone|mac]}"; exit 64 ;;
+  vertical)
+    if (( $# >= 2 )); then
+      set_vertical_layout "$2"
+    else
+      print -r -- "{\"verticalLayout\":\"$(vertical_layout_selection)\"}"
+    fi
+    ;;
+  window)
+    if (( $# == 2 )) && [[ "$2" == clear ]]; then
+      clear_capture_window
+    else
+      (( $# == 4 )) || { print -u2 -- "window requires id, owner, and title"; exit 64; }
+      set_capture_window "$2" "$3" "$4"
+    fi
+    ;;
+  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]|layout [screen|studio|phone|mac]|vertical [screen-phone|screen-mac|triple]|window ID OWNER TITLE|window clear}"; exit 64 ;;
 esac

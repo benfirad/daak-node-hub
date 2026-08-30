@@ -62,6 +62,18 @@ audio path remains unchanged. The DAAK Node panel persists **Screen**, **Studio*
 **Phone**, or **M3 camera** as the next Intel-bound scene; S9 Deck start/stop
 actions use that same saved selection.
 
+Screen content is fail-closed: DAAK Node lists only visible, shareable, named
+application windows and persists the explicitly selected one. OBS uses
+ScreenCaptureKit window capture (`type=1`), never display capture, so the macOS
+menu bar, Dock, desktop icons, notifications outside the selected window, and
+other applications are excluded. If the target window disappears or cannot be
+matched after relaunch, the source remains blank instead of falling back to the
+desktop. Broadcast start stays disabled until a safe window is selected.
+
+The vertical canvas can persist one of three arrangements: **screen + phone**,
+**screen + M3 webcam**, or **triple**. The two-source modes disable the unused
+camera item, so only the selected pair is visible in the 9:16 output.
+
 Recommended routing is landscape for Twitch, landscape plus YouTube's native
 dual-stream option when available, and the dedicated 9:16 canvas for TikTok.
 Platform stream keys are entered locally in OBS/Aitum and must never be committed.
