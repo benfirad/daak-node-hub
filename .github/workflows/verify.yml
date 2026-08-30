@@ -24,7 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Verify updater scripts
-        run: zsh -n macos/build.command macos/install.command macos/Resources/update-daak-node.zsh
+        run: >
+          zsh -n
+          macos/build.command
+          macos/install.command
+          macos/Resources/update-daak-node.zsh
+          macos/Resources/daak-broadcast-control.zsh
+          macos/Resources/daak-broadcast-receiver.zsh
       - name: Type-check menu bar app
         run: >
           xcrun --sdk macosx swiftc
@@ -41,4 +47,6 @@ jobs:
             zsh macos/build.command
           codesign --verify --deep --strict "$RUNNER_TEMP/daak-node-build/daakLOLILE.app"
           test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/update-daak-node.zsh"
+          test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/daak-broadcast-control.zsh"
+          test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/daak-broadcast-receiver.zsh"
           test "$(/usr/libexec/PlistBuddy -c 'Print :DAAKSourceCommit' "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Info.plist")" = "$GITHUB_SHA"

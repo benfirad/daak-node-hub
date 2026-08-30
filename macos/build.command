@@ -35,7 +35,11 @@ xcrun --sdk macosx swiftc \
 
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/update-daak-node.zsh" "$RESOURCES_DIR/update-daak-node.zsh"
-chmod 755 "$RESOURCES_DIR/update-daak-node.zsh"
+cp "$ROOT/Resources/daak-broadcast-control.zsh" "$RESOURCES_DIR/daak-broadcast-control.zsh"
+cp "$ROOT/Resources/daak-broadcast-receiver.zsh" "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
+chmod 755 "$RESOURCES_DIR/update-daak-node.zsh" \
+  "$RESOURCES_DIR/daak-broadcast-control.zsh" \
+  "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
 
 SOURCE_COMMIT="${DAAK_NODE_SOURCE_COMMIT:-}"
 if [[ -z "$SOURCE_COMMIT" ]] && command -v git >/dev/null 2>&1; then
