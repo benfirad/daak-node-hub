@@ -15,11 +15,13 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.9.2</string>
+	<string>2.14.0</string>
 	<key>CFBundleVersion</key>
-	<string>11</string>
+	<string>18</string>
 	<key>DAAKSourceCommit</key>
 	<string>development</string>
+	<key>DAAKSourceVariant</key>
+	<string>opportunity-broadcast-thunderbolt-icons</string>
 	<key>DAAKUpdateChannel</key>
 	<string>main</string>
   <key>LSMinimumSystemVersion</key>

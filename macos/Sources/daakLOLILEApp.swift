@@ -5,6 +5,7 @@ import Foundation
 @preconcurrency import CoreLocation
 import UserNotifications
 import LocalAuthentication
+import UniformTypeIdentifiers
 
 private struct RelayStatus: Decodable {
     struct Permissions: Decodable {
@@ -432,6 +433,7 @@ private struct UpdateCommandResult: Decodable {
 }
 
 private struct NodeConfiguration: Decodable {
+    let thunderboltHost: String?
     let directHost: String?
     let tailHost: String?
     let webmailURL: String?
@@ -454,6 +456,103 @@ private struct NodeConfiguration: Decodable {
         let path = NSHomeDirectory() + "/Library/Application Support/DAAK/node-config.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         return try? JSONDecoder().decode(NodeConfiguration.self, from: data)
+    }
+}
+
+private struct OpportunityHealth: Decodable, Identifiable {
+    struct Counts: Decodable {
+        let events: Int
+        let dossiers: Int
+        let queuedOrRejected: Int
+    }
+
+    struct Source: Decodable, Identifiable {
+        struct Detail: Decodable {
+            let researchScope: String?
+        }
+
+        let sourceId: String
+        let status: String
+        let detail: Detail?
+
+        var id: String { sourceId }
+        var scope: String { detail?.researchScope?.uppercased() ?? "LOCAL" }
+    }
+
+    struct Worker: Decodable {
+        let workerId: String
+        let status: String
+    }
+
+    let status: String
+    let service: String
+    let nodeId: String
+    let authority: String
+    let externalActions: Bool
+    let counts: Counts
+    let scopeCounts: [String: Counts]?
+    let sources: [Source]
+    let workers: [Worker]
+
+    var id: String { nodeId }
+}
+
+private struct OpportunityDossierList: Decodable {
+    let items: [OpportunityDossier]
+}
+
+private struct OpportunityDossier: Decodable, Identifiable {
+    struct Judge: Decodable {
+        let requiredNextEvidence: [String]?
+    }
+
+    struct FounderPriority: Decodable {
+        let score: Int
+        let labels: [String]
+        let startupSupportSourceCount: Int
+        let canadaOfficialPathwaySourceCount: Int
+        let supportIsNotImmigration: Bool
+        let citizenshipGuaranteed: Bool
+    }
+
+    let opportunityId: String
+    let status: String
+    let score: Int
+    let title: String
+    let problem: String
+    let whyNow: String
+    let locality: String
+    let researchScope: String?
+    let topic: String
+    let updatedAt: String
+    let judge: Judge?
+    let founderPriority: FounderPriority?
+
+    var id: String { opportunityId }
+    var isPublished: Bool { status == "PUBLISHED" }
+    var scope: String { researchScope?.uppercased() ?? (locality == "SPAIN" ? "SPAIN" : "LOCAL") }
+    var nextEvidence: [String] { Array((judge?.requiredNextEvidence ?? []).prefix(3)) }
+}
+
+private enum OpportunityResearchScope: String, CaseIterable, Identifiable {
+    case local = "LOCAL"
+    case spain = "SPAIN"
+    case world = "WORLD"
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .local: "Granada / Andalucía"
+        case .spain: "Tüm İspanya"
+        case .world: "Dünya · AB öncelikli"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .local: "Yerel problem, alıcı ve destek sinyalleri"
+        case .spain: "Ulusal problem, alıcı, ihale ve dönüşüm sinyalleri"
+        case .world: "Sevilla Üniversitesi ve AB önce · Kanada resmî yolları ayrı izlenir"
+        }
     }
 }
 
@@ -545,6 +644,10 @@ private enum LocalCommand {
     }
 
     static func run(_ executable: String, _ arguments: [String], input: String) async -> CommandResult {
+        await run(executable, arguments, inputData: Data(input.utf8))
+    }
+
+    static func run(_ executable: String, _ arguments: [String], inputData: Data) async -> CommandResult {
         await Task.detached(priority: .userInitiated) {
             let process = Process()
             let output = Pipe()
@@ -557,7 +660,7 @@ private enum LocalCommand {
             process.standardInput = stdin
             do {
                 try process.run()
-                stdin.fileHandleForWriting.write(Data(input.utf8))
+                stdin.fileHandleForWriting.write(inputData)
                 try? stdin.fileHandleForWriting.close()
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
@@ -817,6 +920,7 @@ private final class MailAccountMonitor: ObservableObject {
 @MainActor
 private final class MYAL11Monitor: ObservableObject {
     enum Route: String {
+        case thunderbolt = "Thunderbolt · 40 Gb/sn"
         case cable = "Kablo · otomatik"
         case tailscale = "Tailscale · otomatik"
         case offline = "Bağlantı yok"
@@ -1029,7 +1133,10 @@ private final class MYAL11Monitor: ObservableObject {
         if FileManager.default.isExecutableFile(atPath: routeSelectorPath) {
             let selected = await LocalCommand.run("/bin/zsh", [routeSelectorPath, "status"])
             switch selected.output.trimmingCharacters(in: .whitespacesAndNewlines) {
-            case "cable", "thunderbolt":
+            case "thunderbolt":
+                route = .thunderbolt
+                return
+            case "cable":
                 route = .cable
                 return
             case "tailscale":
@@ -1045,6 +1152,13 @@ private final class MYAL11Monitor: ObservableObject {
 
         // Keep the configuration probes as a compatibility fallback for older
         // installations that do not have the shared route selector yet.
+        if let thunderboltHost = configuration?.thunderboltHost, !thunderboltHost.isEmpty {
+            let thunderbolt = await LocalCommand.run("/usr/bin/nc", ["-z", "-G", "1", thunderboltHost, "22"])
+            if thunderbolt.exitCode == 0 {
+                route = .thunderbolt
+                return
+            }
+        }
         if let directHost = configuration?.directHost, !directHost.isEmpty {
             let cable = await LocalCommand.run("/usr/bin/nc", ["-6", "-z", "-G", "1", directHost, "22"])
             if cable.exitCode == 0 {
@@ -1093,7 +1207,11 @@ private final class MYAL11Monitor: ObservableObject {
     }
 
     private var selectedSSHHost: String {
-        route == .cable ? "mya-l11-direct" : "mya-l11-tail"
+        switch route {
+        case .thunderbolt: return "mya-l11-thunderbolt"
+        case .cable: return "mya-l11-direct"
+        case .tailscale, .offline: return "mya-l11-tail"
+        }
     }
 
     func openScreen() {
@@ -1255,6 +1373,280 @@ private final class MYAL11Monitor: ObservableObject {
 }
 
 @MainActor
+private final class OpportunityMonitor: ObservableObject {
+    @Published private(set) var healthNodes: [OpportunityHealth] = []
+    @Published private(set) var opportunities: [OpportunityDossier] = []
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var isOpeningDashboard = false
+    @Published private(set) var lastUpdated: Date?
+    @Published private(set) var lastError: String?
+    @Published private(set) var actionMessage: String?
+
+    private let localDashboardURL = "http://127.0.0.1:5070/"
+    private var timer: Timer?
+    private var retryTask: Task<Void, Never>?
+
+    init() {
+        timer = Timer(timeInterval: 300, repeats: true) { _ in
+            Task { @MainActor [weak self] in await self?.refresh() }
+        }
+        timer?.tolerance = 30
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
+        Task { await refresh() }
+    }
+
+    deinit {
+        timer?.invalidate()
+        retryTask?.cancel()
+    }
+
+    func sourceCoverage(for scope: OpportunityResearchScope) -> (live: Int, total: Int) {
+        var all = Set<String>()
+        var live = Set<String>()
+        for node in healthNodes {
+            for source in node.sources where source.scope == scope.rawValue {
+                all.insert(source.sourceId)
+                if source.status.uppercased() == "LIVE" { live.insert(source.sourceId) }
+            }
+        }
+        return (live.count, all.count)
+    }
+
+    var fabricReady: Bool {
+        let coverage = sourceCoverage(for: .local)
+        return coverage.total > 0 && coverage.live == coverage.total && !healthNodes.isEmpty
+    }
+
+    func fabricReady(for scope: OpportunityResearchScope) -> Bool {
+        let coverage = sourceCoverage(for: scope)
+        return coverage.total > 0 && coverage.live == coverage.total && !healthNodes.isEmpty
+    }
+
+    func counts(for scope: OpportunityResearchScope) -> OpportunityHealth.Counts? {
+        healthNodes.compactMap { $0.scopeCounts?[scope.rawValue] }.max { left, right in
+            left.events < right.events
+        }
+    }
+
+    func events(for scope: OpportunityResearchScope) -> Int {
+        counts(for: scope)?.events ?? (scope == .local ? healthNodes.map(\.counts.events).max() ?? 0 : 0)
+    }
+
+    func publishedCount(for scope: OpportunityResearchScope) -> Int {
+        counts(for: scope)?.dossiers ?? 0
+    }
+
+    func reviewedCount(for scope: OpportunityResearchScope) -> Int {
+        counts(for: scope)?.queuedOrRejected ?? 0
+    }
+    var aiReady: Bool {
+        healthNodes.contains { node in
+            node.workers.contains { $0.status.uppercased() == "READY" }
+        }
+    }
+
+    func validationCount(for scope: OpportunityResearchScope) -> Int {
+        opportunities.filter { $0.scope == scope.rawValue && !$0.isPublished }.count
+    }
+
+    func opportunities(for scope: OpportunityResearchScope) -> [OpportunityDossier] {
+        opportunities.filter { $0.scope == scope.rawValue }.sorted { left, right in
+            if left.isPublished != right.isPublished { return left.isPublished }
+            if scope == .world {
+                let leftPriority = left.founderPriority?.score ?? 0
+                let rightPriority = right.founderPriority?.score ?? 0
+                if leftPriority != rightPriority { return leftPriority > rightPriority }
+            }
+            return left.score > right.score
+        }
+    }
+
+    func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        async let myaHealth = Self.fetchHealth(host: "mya-l11-tail", windows: false)
+        async let lolileHealth = Self.fetchHealth(host: "lolile-openclaw", windows: true)
+        async let lolileDossiers = Self.fetchDossiers(host: "lolile-openclaw", windows: true)
+        async let myaDossiers = Self.fetchDossiers(host: "mya-l11-tail", windows: false)
+
+        let (mya, lolile, lolileIdeas, myaIdeas) = await (
+            myaHealth, lolileHealth, lolileDossiers, myaDossiers
+        )
+        let healthy = [mya, lolile].compactMap { $0 }
+        guard !healthy.isEmpty else {
+            lastError = "MYA-L11 ve LOLILE araştırma düğümlerine ulaşılamadı; son doğrulanmış görünüm korunuyor."
+            scheduleRetry()
+            return
+        }
+
+        healthNodes = healthy.sorted { $0.nodeId < $1.nodeId }
+        if let list = lolileIdeas ?? myaIdeas {
+            opportunities = list.items
+                .filter(Self.isUseful)
+                .sorted {
+                    if $0.isPublished != $1.isPublished { return $0.isPublished }
+                    return $0.score > $1.score
+                }
+                .map { $0 }
+        }
+        lastUpdated = Date()
+        if healthy.count < 2 {
+            lastError = "Araştırma düğümlerinden biri çevrimdışı; mevcut düğümün verisi gösteriliyor."
+            scheduleRetry()
+        } else if lolileIdeas == nil && myaIdeas == nil {
+            lastError = "Fikir dosyaları okunamadı; önceki liste korunuyor."
+            scheduleRetry()
+        } else {
+            lastError = nil
+            retryTask?.cancel()
+            retryTask = nil
+        }
+    }
+
+    private func scheduleRetry() {
+        guard retryTask == nil else { return }
+        retryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.retryTask = nil
+            await self.refresh()
+        }
+    }
+
+    func openDashboard() async {
+        guard !isOpeningDashboard else { return }
+        isOpeningDashboard = true
+        defer { isOpeningDashboard = false }
+
+        if await Self.localDashboardReady(localDashboardURL) {
+            NSWorkspace.shared.open(URL(string: localDashboardURL)!)
+            return
+        }
+
+        let targets: [(host: String, windows: Bool)] = [
+            ("lolile-openclaw", true),
+            ("mya-l11-tail", false),
+        ]
+        for target in targets {
+            guard await Self.fetchHealth(host: target.host, windows: target.windows) != nil else { continue }
+            let tunnel = await LocalCommand.run(
+                "/usr/bin/ssh",
+                [
+                    "-f", "-N",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=8",
+                    "-o", "ConnectionAttempts=1",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "-L", "127.0.0.1:5070:127.0.0.1:5070",
+                    target.host,
+                ]
+            )
+            guard tunnel.exitCode == 0 else { continue }
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if await Self.localDashboardReady(localDashboardURL) {
+                NSWorkspace.shared.open(URL(string: localDashboardURL)!)
+                actionMessage = "Fırsat paneli güvenli loopback tünelinden açıldı."
+                return
+            }
+        }
+        actionMessage = "Fırsat paneli için güvenli tünel açılamadı."
+    }
+
+    private static func fetchHealth(host: String, windows: Bool) async -> OpportunityHealth? {
+        let endpoint = "http://127.0.0.1:5070/healthz"
+        let command = windows
+            ? "curl.exe --fail --silent --show-error --max-time 8 \(endpoint)"
+            : "curl --fail --silent --show-error --max-time 8 \(endpoint)"
+        guard let value: OpportunityHealth = await fetchJSON(host: host, command: command),
+              value.service == "DAAK Opportunity Intelligence",
+              value.authority == "RESEARCH_ONLY",
+              value.externalActions == false else { return nil }
+        return value
+    }
+
+    private static func fetchDossiers(host: String, windows: Bool) async -> OpportunityDossierList? {
+        let endpoint = "http://127.0.0.1:5070/api/opportunities?include_rejected=true&limit=1000"
+        let command = windows
+            ? "curl.exe --fail --silent --show-error --max-time 8 \(endpoint)"
+            : "curl --fail --silent --show-error --max-time 8 '\(endpoint)'"
+        return await fetchJSON(host: host, command: command)
+    }
+
+    private static func fetchJSON<T: Decodable>(host: String, command: String) async -> T? {
+        let result = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=8",
+                "-o", "ConnectionAttempts=1",
+                "-o", "ServerAliveInterval=10",
+                host,
+                command,
+            ]
+        )
+        guard result.exitCode == 0 else { return nil }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try? decoder.decode(T.self, from: Data(result.output.utf8))
+    }
+
+    private static func localDashboardReady(_ baseURL: String) async -> Bool {
+        let result = await LocalCommand.run(
+            "/usr/bin/curl",
+            ["-fsS", "--max-time", "3", baseURL + "healthz"]
+        )
+        guard result.exitCode == 0 else { return false }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let health = try? decoder.decode(OpportunityHealth.self, from: Data(result.output.utf8)) else {
+            return false
+        }
+        return health.service == "DAAK Opportunity Intelligence"
+            && health.authority == "RESEARCH_ONLY"
+            && health.externalActions == false
+    }
+
+    private static func isUseful(_ item: OpportunityDossier) -> Bool {
+        if item.isPublished { return true }
+        guard item.score >= 50 else { return false }
+        let title = item.title.lowercased()
+        let genericPrefixes = [
+            "no defensible", "no supportable", "no falsifiable", "no publishable", "insufficient evidence",
+        ]
+        return !genericPrefixes.contains { title.hasPrefix($0) }
+    }
+}
+
+private struct DeckTile: Identifiable, Hashable {
+    let tag: String
+    let title: String
+    let action: String
+    let protected: Bool
+
+    var id: String { action }
+
+    static let all: [DeckTile] = [
+        .init(tag: "VOL-", title: "SES AZALT", action: "volume-down", protected: false),
+        .init(tag: "MUTE", title: "SESSİZ", action: "volume-mute", protected: false),
+        .init(tag: "VOL+", title: "SES ARTIR", action: "volume-up", protected: false),
+        .init(tag: "PREV", title: "ÖNCEKİ", action: "music-previous", protected: false),
+        .init(tag: "PLAY", title: "OYNAT / DURAKLAT", action: "music-playpause", protected: false),
+        .init(tag: "NEXT", title: "SONRAKİ", action: "music-next", protected: false),
+        .init(tag: "FILE", title: "FINDER", action: "open-finder", protected: false),
+        .init(tag: "WEB", title: "SAFARI", action: "open-browser", protected: false),
+        .init(tag: "CODEX", title: "CODEX", action: "open-codex", protected: false),
+        .init(tag: "DAAK", title: "DAAK LOLILE", action: "open-daak", protected: false),
+        .init(tag: "DESK", title: "MASAÜSTÜ", action: "show-desktop", protected: false),
+        .init(tag: "VIEW", title: "MISSION CONTROL", action: "mission-control", protected: false),
+        .init(tag: "TERM", title: "TERMINAL", action: "open-terminal", protected: false),
+        .init(tag: "OLED", title: "EKRANI UYUT", action: "display-sleep", protected: true),
+        .init(tag: "LOCK", title: "MAC'İ KİLİTLE", action: "lock-screen", protected: true)
+    ]
+}
+
+@MainActor
 private final class NodeMonitor: ObservableObject {
     @Published private(set) var status: NodeStatus?
     @Published private(set) var location: NodeLocation?
@@ -1265,6 +1657,8 @@ private final class NodeMonitor: ObservableObject {
     @Published private(set) var isPhoneExitNodeAvailable = false
     @Published private(set) var isUsingPhoneExitNode = false
     @Published private(set) var deviceHealth: NodeDeviceHealth?
+    @Published private(set) var deckImageRevision = 0
+    @Published private(set) var isDeckSyncing = false
     @Published var host: String
 
     private let hostKey = "daakNodeHost"
@@ -1492,6 +1886,94 @@ private final class NodeMonitor: ObservableObject {
         guard Self.isSafeHost(host), let url = URL(string: "ssh://\(host):\(sshPort)") else { return }
         NSWorkspace.shared.open(url)
         actionMessage = "Vaytniga terminali açılıyor."
+    }
+
+    func deckImage(for action: String) -> NSImage? {
+        guard DeckTile.all.contains(where: { $0.action == action }) else { return nil }
+        return NSImage(contentsOf: deckImageURL(for: action))
+    }
+
+    func installDeckImage(from sourceURL: URL, for action: String) async {
+        guard DeckTile.all.contains(where: { $0.action == action }) else {
+            actionMessage = "Deck görseli reddedildi: geçersiz eylem."
+            return
+        }
+        guard Self.isSafeHost(host) else {
+            actionMessage = "Önce Vaytniga Tailnet adresini doğrula."
+            return
+        }
+        guard let source = NSImage(contentsOf: sourceURL),
+              let png = Self.squarePNG(from: source, pixels: 640) else {
+            actionMessage = "Fotoğraf okunamadı. PNG, JPEG veya HEIC seç."
+            return
+        }
+
+        isDeckSyncing = true
+        defer { isDeckSyncing = false }
+        let localURL = deckImageURL(for: action)
+        do {
+            try FileManager.default.createDirectory(at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try png.write(to: localURL, options: .atomic)
+            deckImageRevision &+= 1
+        } catch {
+            actionMessage = "M3 önizlemesi kaydedilemedi: \(error.localizedDescription)"
+            return
+        }
+
+        let directory = "storage/shared/Download/DAAK/ControlDeck"
+        let remote = "\(directory)/\(action).png"
+        let temporary = "\(directory)/.\(action).png.uploading"
+        let remoteCommand = "mkdir -p \(directory) && cat > \(temporary) && test -s \(temporary) && mv -f \(temporary) \(remote)"
+        let upload = await LocalCommand.run(
+            "/usr/bin/ssh",
+            sshArguments(remoteCommand: remoteCommand),
+            inputData: png
+        )
+        actionMessage = upload.exitCode == 0
+            ? "\(action) görseli M3 önizlemesine ve Vaytniga’ya aktarıldı."
+            : "M3 önizlemesi hazır; telefon aktarımı başarısız: \(upload.output)"
+    }
+
+    func removeDeckImage(for action: String) async {
+        guard DeckTile.all.contains(where: { $0.action == action }) else { return }
+        try? FileManager.default.removeItem(at: deckImageURL(for: action))
+        deckImageRevision &+= 1
+        guard Self.isSafeHost(host) else {
+            actionMessage = "Görsel M3 önizlemesinden kaldırıldı."
+            return
+        }
+        isDeckSyncing = true
+        defer { isDeckSyncing = false }
+        let result = await LocalCommand.run(
+            "/usr/bin/ssh",
+            sshArguments(remoteCommand: "rm -f -- storage/shared/Download/DAAK/ControlDeck/\(action).png")
+        )
+        actionMessage = result.exitCode == 0
+            ? "\(action) görseli M3 ve Vaytniga’dan kaldırıldı."
+            : "M3 görseli kaldırıldı; telefon temizlenemedi: \(result.output)"
+    }
+
+    private func deckImageURL(for action: String) -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/DAAK/ControlDeck", isDirectory: true)
+            .appendingPathComponent(action + ".png")
+    }
+
+    private static func squarePNG(from source: NSImage, pixels: CGFloat) -> Data? {
+        let sourceSize = source.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+        let output = NSImage(size: NSSize(width: pixels, height: pixels))
+        output.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let scale = max(pixels / sourceSize.width, pixels / sourceSize.height)
+        let size = NSSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let rect = NSRect(x: (pixels - size.width) / 2, y: (pixels - size.height) / 2,
+                          width: size.width, height: size.height)
+        source.draw(in: rect, from: .zero, operation: .copy, fraction: 1)
+        output.unlockFocus()
+        guard let tiff = output.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
     }
 
     private func sshArguments(remoteCommand: String) -> [String] {
@@ -1998,9 +2480,12 @@ private final class LocalMacMonitor: ObservableObject {
 private enum DevicePanel: String, CaseIterable, Identifiable {
     case devices
     case operations
+    case opportunities
+    case broadcast
     case lolile
     case myaL11
     case node
+    case deck
 
     var id: String { rawValue }
 
@@ -2008,9 +2493,12 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
         switch self {
         case .devices: return "Merkez"
         case .operations: return "Servisler"
+        case .opportunities: return "Fırsatlar"
+        case .broadcast: return "Yayın"
         case .lolile: return "LOLİLE"
         case .myaL11: return "MYA-L11"
         case .node: return "Vaytniga"
+        case .deck: return "Deck"
         }
     }
 
@@ -2018,9 +2506,151 @@ private enum DevicePanel: String, CaseIterable, Identifiable {
         switch self {
         case .devices: return "square.grid.2x2.fill"
         case .operations: return "server.rack"
+        case .opportunities: return "scope"
+        case .broadcast: return "dot.radiowaves.left.and.right"
         case .lolile: return "desktopcomputer"
         case .myaL11: return "laptopcomputer"
         case .node: return "iphone"
+        case .deck: return "rectangle.grid.3x2.fill"
+        }
+    }
+}
+
+private struct BroadcastStatus: Decodable {
+    let route: String
+    let sender: String
+    let receiver: String
+    let ready: Bool
+    let streaming: Bool
+}
+
+@MainActor
+private final class BroadcastMonitor: ObservableObject {
+    @Published private(set) var status: BroadcastStatus?
+    @Published private(set) var isWorking = false
+    @Published private(set) var message = "Yayın yolu denetleniyor."
+
+    private let script = NSHomeDirectory() + "/Library/Application Support/DAAK/Broadcast/daak-broadcast-control.zsh"
+
+    init() {
+        Task { await refresh() }
+    }
+
+    func refresh() async {
+        guard !isWorking else { return }
+        let result = await LocalCommand.run(script, ["status"])
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(BroadcastStatus.self, from: data) else {
+            status = nil
+            message = result.output.isEmpty ? "Yayın denetleyicisi bulunamadı." : result.output
+            return
+        }
+        status = decoded
+        message = decoded.streaming ? "Canlı SRT akışı Intel Mac'e ulaşıyor." : routeMessage(decoded)
+    }
+
+    func start() async { await perform("start", progress: "Yayın yolu başlatılıyor…") }
+    func stop() async { await perform("stop", progress: "Yayın durduruluyor…") }
+    func openLocal() async { await perform("local", progress: "M3 OBS açılıyor…") }
+
+    private func perform(_ action: String, progress: String) async {
+        guard !isWorking else { return }
+        isWorking = true
+        message = progress
+        let result = await LocalCommand.run(script, [action])
+        isWorking = false
+        if result.exitCode != 0 {
+            message = result.output.isEmpty ? "Yayın komutu çalışmadı." : result.output
+            return
+        }
+        try? await Task.sleep(for: .seconds(1))
+        await refresh()
+    }
+
+    private func routeMessage(_ value: BroadcastStatus) -> String {
+        if value.route == "offline" { return "Intel erişilemiyor; yerel OBS kullanılabilir." }
+        if value.receiver == "idle" { return "Intel alıcısı henüz hazır değil." }
+        if value.receiver == "receiving" { return "Intel alıyor ve VideoToolbox ile işliyor." }
+        if value.receiver == "listening" { return "Intel alıcı hazır; yayın başlatılabilir." }
+        if value.sender == "idle" { return "M3 OBS açık; ara akış beklemede." }
+        return "Yayın beklemede."
+    }
+}
+
+private struct BroadcastView: View {
+    @EnvironmentObject private var monitor: BroadcastMonitor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("DAAK YAYIN").font(.headline)
+                    Text(monitor.message).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Circle()
+                    .fill(monitor.status?.streaming == true ? Color.green : Color.secondary.opacity(0.45))
+                    .frame(width: 10, height: 10)
+            }
+
+            if let status = monitor.status {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
+                    GridRow { Text("Rota").foregroundStyle(.secondary); Text(routeLabel(status.route)).bold() }
+                    GridRow { Text("M3 gönderici").foregroundStyle(.secondary); Text(stateLabel(status.sender)) }
+                    GridRow { Text("Intel alıcı").foregroundStyle(.secondary); Text(stateLabel(status.receiver)) }
+                }
+                .font(.callout)
+            }
+
+            HStack(spacing: 8) {
+                Button("Başlat") { Task { await monitor.start() } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(monitor.isWorking || monitor.status?.streaming == true)
+                Button("Durdur") { Task { await monitor.stop() } }
+                    .buttonStyle(.bordered)
+                    .disabled(monitor.isWorking)
+                Button("M3 OBS") { Task { await monitor.openLocal() } }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button { Task { await monitor.refresh() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(monitor.isWorking)
+                .accessibilityLabel("Yayın durumunu yenile")
+            }
+
+            Label("Thunderbolt · 1080p60 · 25 Mb/sn · MTU 9000", systemImage: "bolt.horizontal.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(monitor.status?.route == "direct" ? Color.green : Color.secondary)
+
+            Text("Thunderbolt bağlıysa doğrudan, düşük gecikmeli SRT yolu kullanılır; kablo ayrılırsa Tailscale 1080p30 rotasına otomatik geçilir. Platform hesabı ve yayın anahtarı yalnız Intel tarafında kalır.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 330, alignment: .topLeading)
+        .task { await monitor.refresh() }
+    }
+
+    private func routeLabel(_ value: String) -> String {
+        switch value {
+        case "direct": return "Thunderbolt"
+        case "tailscale": return "Tailscale"
+        default: return "Yerel / çevrimdışı"
+        }
+    }
+
+    private func stateLabel(_ value: String) -> String {
+        switch value {
+        case "streaming": return "Akışta"
+        case "listening": return "Hazır"
+        case "receiving": return "Alıyor"
+        case "idle": return "Beklemede"
+        case "stopped": return "Kapalı"
+        default: return value.capitalized
         }
     }
 }
@@ -2053,16 +2683,11 @@ private struct DAAKPanelPicker: View {
                         selection = panel
                     }
                 } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: panel.symbol)
-                            .font(.caption2.weight(.semibold))
-                        Text(panel.title)
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                    }
+                    Image(systemName: panel.symbol)
+                        .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(selection == panel ? Color.primary : Color.secondary)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 7)
+                    .padding(.vertical, 8)
                     .contentShape(Rectangle())
                     .background {
                         if selection == panel {
@@ -2074,6 +2699,7 @@ private struct DAAKPanelPicker: View {
                     }
                 }
                 .buttonStyle(DAAKPressStyle())
+                .help(panel.title)
                 .accessibilityLabel(panel.title)
                 .accessibilityAddTraits(selection == panel ? .isSelected : [])
             }
@@ -2630,6 +3256,294 @@ private struct ServerServicesView: View {
     }
 }
 
+private struct OpportunityMetricCard: View {
+    let title: String
+    let value: String
+    let detail: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title.uppercased())
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.monospacedDigit().weight(.semibold))
+                .foregroundStyle(tint)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
+    }
+}
+
+private struct OpportunityDossierCard: View {
+    let item: OpportunityDossier
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.isPublished ? "YAYINLANAN FİKİR" : "SAHADA DOĞRULA")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(item.isPublished ? Color.green : Color.orange)
+                    Text(item.title)
+                        .font(.callout.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("\(item.locality) · \(item.topic)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    if let priority = item.founderPriority, priority.score > 0 {
+                        Text("KURUCU ÖNCELİĞİ \(priority.score) · \(priority.labels.prefix(2).joined(separator: " · "))")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.blue)
+                    }
+                }
+                Spacer(minLength: 8)
+                Text("\(item.score)")
+                    .font(.title2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(item.isPublished ? Color.green : Color.orange)
+                    .frame(minWidth: 42)
+                    .padding(.vertical, 5)
+                    .background(
+                        (item.isPublished ? Color.green : Color.orange).opacity(0.1),
+                        in: RoundedRectangle(cornerRadius: 9)
+                    )
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("KANITLANAN PROBLEM")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(item.problem)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(expanded ? nil : 3)
+            }
+
+            if expanded {
+                if let priority = item.founderPriority,
+                   priority.canadaOfficialPathwaySourceCount > 0 {
+                    Text("Kanada resmî yol sinyali var; startup desteği, oturum ve vatandaşlık ayrı doğrulanır.")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.blue)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("NEDEN ŞİMDİ")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(item.whyNow)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !item.nextEvidence.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("BELEDİYEDE SORULACAK EKSİK KANIT")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.orange)
+                        ForEach(Array(item.nextEvidence.enumerated()), id: \.offset) { index, evidence in
+                            Text("\(index + 1). \(evidence)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
+            Button(expanded ? "Daralt" : "Eksik kanıtı göster") {
+                expanded.toggle()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption.weight(.medium))
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(item.isPublished ? Color.green : Color.orange)
+                .frame(width: 3)
+                .padding(.vertical, 1)
+        }
+    }
+}
+
+private struct OpportunityView: View {
+    @EnvironmentObject private var monitor: OpportunityMonitor
+    @State private var selectedScope: OpportunityResearchScope = .local
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 2)
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("FIRSATLAR // RESEARCH")
+                            .font(.headline)
+                        Text("\(selectedScope.title) · kanıt öncelikli startup araştırması")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if monitor.isRefreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        StatusPill(online: monitor.fabricReady(for: selectedScope))
+                    }
+                }
+
+                Picker("Araştırma kapsamı", selection: $selectedScope) {
+                    ForEach(OpportunityResearchScope.allCases) { scope in
+                        Text(scope.title).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                Text(selectedScope.subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "lock.shield.fill")
+                        .foregroundStyle(.green)
+                    Text("RESEARCH_ONLY · Sistem başvuru yapamaz, kurumla iletişime geçemez ve resmî işlem başlatamaz.")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+
+                LazyVGrid(columns: columns, spacing: 8) {
+                    let coverage = monitor.sourceCoverage(for: selectedScope)
+                    OpportunityMetricCard(
+                        title: "Kaynak fabric",
+                        value: "\(coverage.live)/\(coverage.total)",
+                        detail: monitor.fabricReady(for: selectedScope) ? "Seçili kapsam canlı" : "Düğümler tamamlıyor",
+                        tint: monitor.fabricReady(for: selectedScope) ? .green : .orange
+                    )
+                    OpportunityMetricCard(
+                        title: "Kanıt olayı",
+                        value: "\(monitor.events(for: selectedScope))",
+                        detail: "Tekilleştirilmiş kayıt",
+                        tint: .blue
+                    )
+                    OpportunityMetricCard(
+                        title: "İncelenen",
+                        value: "\(monitor.reviewedCount(for: selectedScope))",
+                        detail: "Bağımsız AI + kapı",
+                        tint: .purple
+                    )
+                    OpportunityMetricCard(
+                        title: "Yayınlanan",
+                        value: "\(monitor.publishedCount(for: selectedScope))",
+                        detail: "Doğrulama adayı \(monitor.validationCount(for: selectedScope))",
+                        tint: monitor.publishedCount(for: selectedScope) > 0 ? .green : .orange
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("ARAŞTIRMA DÜĞÜMLERİ")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    ForEach(monitor.healthNodes) { node in
+                        let sources = node.sources.filter { $0.scope == selectedScope.rawValue }
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(node.status == "ok" ? Color.green : Color.orange)
+                                .frame(width: 7, height: 7)
+                            Text(node.nodeId).font(.caption.weight(.semibold))
+                            Spacer()
+                            Text("\(sources.filter { $0.status == "LIVE" }.count)/\(sources.count) kaynak")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            if node.workers.contains(where: { $0.status == "READY" }) {
+                                Text("AI READY")
+                                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(.purple)
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 11))
+
+                HStack {
+                    Text("DOĞRULAMA ADAYLARI")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Puan tek başına yayınlatmaz")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+
+                let scopedOpportunities = monitor.opportunities(for: selectedScope)
+                if scopedOpportunities.isEmpty {
+                    Text("\(selectedScope.title) kapsamında şu an sahaya sorulmaya değer, jenerik olmayan bir hipotez yok. Sistem yeni problem ve alıcı kanıtlarını taramayı sürdürüyor.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 11))
+                } else {
+                    ForEach(scopedOpportunities) { item in
+                        OpportunityDossierCard(item: item)
+                    }
+                }
+
+                if let error = monitor.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let message = monitor.actionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(message.contains("açılamadı") ? Color.orange : Color.secondary)
+                }
+
+                HStack {
+                    Button {
+                        Task { await monitor.refresh() }
+                    } label: {
+                        Label("Yenile", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(monitor.isRefreshing)
+
+                    Button {
+                        Task { await monitor.openDashboard() }
+                    } label: {
+                        Label("Paneli aç", systemImage: "safari")
+                    }
+                    .disabled(monitor.isOpeningDashboard)
+
+                    Spacer()
+                    if let updated = monitor.lastUpdated {
+                        Text(updated.formatted(date: .omitted, time: .shortened))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(16)
+        }
+        .frame(maxHeight: 700)
+    }
+}
+
 private struct OperationsView: View {
     @State private var section = 0
 
@@ -2638,6 +3552,7 @@ private struct OperationsView: View {
             Picker("Servis grubu", selection: $section) {
                 Text("Altyapı").tag(0)
                 Text("Mail").tag(1)
+                Text("Fırsatlar").tag(2)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -2648,8 +3563,10 @@ private struct OperationsView: View {
 
             if section == 0 {
                 ServerServicesView()
-            } else {
+            } else if section == 1 {
                 MailAccountsView()
+            } else {
+                OpportunityView()
             }
         }
     }
@@ -2675,7 +3592,7 @@ private struct MYAL11MenuView: View {
             }
 
             HStack(spacing: 6) {
-                Image(systemName: monitor.route == .cable ? "cable.connector" : "network")
+                Image(systemName: monitor.route == .thunderbolt ? "bolt.horizontal.fill" : (monitor.route == .cable ? "cable.connector" : "network"))
                     .foregroundStyle(monitor.isOnline ? Color.green : Color.orange)
                 Text(monitor.routeLabel)
                     .font(.caption.weight(.medium))
@@ -2989,6 +3906,127 @@ private struct NodeMenuView: View {
     }
 }
 
+private struct DeckManagerView: View {
+    @EnvironmentObject private var node: NodeMonitor
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 7), count: 5)
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("DECK // M3 MAC")
+                            .font(.headline)
+                        Text("Telefonun yatay 5×3 düzeninde önizle · Vaytniga’ya aktar")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if node.isDeckSyncing { ProgressView().controlSize(.small) }
+                }
+
+                Text("Fotoğraf kare PNG’ye yeniden kodlanır; konum ve kamera metadata’sı taşınmaz. Aktarım yalnız özel Tailnet/SSH hattından ve sabit Deck adlarıyla yapılır.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                LazyVGrid(columns: columns, spacing: 7) {
+                    ForEach(DeckTile.all) { tile in
+                        Button {
+                            chooseImage(for: tile)
+                        } label: {
+                            deckPreview(tile)
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .contextMenu {
+                            Button("Fotoğraf seç…") { chooseImage(for: tile) }
+                            if node.deckImage(for: tile.action) != nil {
+                                Button("Görseli kaldır", role: .destructive) {
+                                    Task { await node.removeDeckImage(for: tile.action) }
+                                }
+                            }
+                        }
+                        .help("\(tile.title) için fotoğraf seç")
+                    }
+                }
+
+                if let message = node.actionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(message.contains("başarısız") || message.contains("açılamadı") ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(16)
+        }
+        .frame(maxHeight: 690)
+    }
+
+    @ViewBuilder
+    private func deckPreview(_ tile: DeckTile) -> some View {
+        let image = node.deckImage(for: tile.action)
+        ZStack(alignment: .topTrailing) {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .overlay(Color.black.opacity(0.36))
+            } else {
+                LinearGradient(
+                    colors: tile.protected
+                        ? [Color.purple.opacity(0.34), Color.black.opacity(0.78)]
+                        : [Color(nsColor: .controlBackgroundColor), Color.black.opacity(0.2)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tile.tag)
+                    .font(.caption2.monospaced().weight(.bold))
+                    .foregroundStyle(image == nil ? Color.purple : Color.white)
+                Spacer(minLength: 2)
+                Text(tile.title)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.75)
+                Text(image == nil ? "FOTOĞRAF SEÇ" : "M3 PREVIEW")
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.68))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .padding(10)
+
+            Image(systemName: image == nil ? "photo.badge.plus" : "checkmark.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(image == nil ? Color.secondary : Color.green)
+                .padding(8)
+        }
+        .frame(height: 86)
+        .clipped()
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(tile.protected ? Color.purple.opacity(0.7) : Color.primary.opacity(0.12), lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .id("\(tile.action)-\(node.deckImageRevision)")
+    }
+
+    private func chooseImage(for tile: DeckTile) {
+        let panel = NSOpenPanel()
+        panel.title = "\(tile.title) için Deck fotoğrafı seç"
+        panel.prompt = "Seç ve aktar"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await node.installDeckImage(from: url, for: tile.action) }
+    }
+}
+
 private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var relay: RelayMonitor
     @EnvironmentObject private var node: NodeMonitor
@@ -2997,6 +4035,8 @@ private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var mail: MailAccountMonitor
     @EnvironmentObject private var updater: UpdateMonitor
     @EnvironmentObject private var localMac: LocalMacMonitor
+    @EnvironmentObject private var opportunity: OpportunityMonitor
+    @EnvironmentObject private var broadcast: BroadcastMonitor
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var selection: DevicePanel = .devices
@@ -3034,6 +4074,10 @@ private struct DAAKDevicesMenuView: View {
                     DeviceOverviewView(selection: $selection)
                 case .operations:
                     OperationsView()
+                case .opportunities:
+                    OpportunityView()
+                case .broadcast:
+                    BroadcastView()
                 case .lolile:
                     ScrollView {
                         RelayMenuView()
@@ -3043,6 +4087,8 @@ private struct DAAKDevicesMenuView: View {
                     MYAL11MenuView()
                 case .node:
                     NodeMenuView()
+                case .deck:
+                    DeckManagerView()
                 }
             }
             .id(selection)
@@ -3432,6 +4478,8 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
     private let mail = MailAccountMonitor()
     private let updater = UpdateMonitor()
     private let localMac = LocalMacMonitor()
+    private let opportunity = OpportunityMonitor()
+    private let broadcast = BroadcastMonitor()
 
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
@@ -3446,6 +4494,8 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(mail)
             .environmentObject(updater)
             .environmentObject(localMac)
+            .environmentObject(opportunity)
+            .environmentObject(broadcast)
 
         popover.behavior = .transient
         popover.animates = true
