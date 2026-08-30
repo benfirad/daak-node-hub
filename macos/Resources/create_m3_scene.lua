@@ -173,6 +173,33 @@ local function ensure_camera_source(source_name, device_id, device_name)
     return source
 end
 
+local function remove_legacy_camera_duplicates()
+    local primary = obs.obs_get_source_by_name(mac_source_name)
+    if primary == nil then
+        return
+    end
+    obs.obs_source_release(primary)
+
+    for _, name in ipairs({ mac_source_name .. " 2", mac_source_name .. " 2 2" }) do
+        local source = obs.obs_get_source_by_name(name)
+        if source ~= nil then
+            for _, scene_name in ipairs({ studio_scene_name, mac_scene_name }) do
+                local scene = obs.obs_get_scene_by_name(scene_name)
+                if scene ~= nil then
+                    local item = obs.obs_scene_find_source(scene, name)
+                    if item ~= nil then
+                        obs.obs_sceneitem_remove(item)
+                    end
+                    obs.obs_scene_release(scene)
+                end
+            end
+            obs.obs_source_remove(source)
+            obs.obs_source_release(source)
+            obs.script_log(obs.LOG_INFO, "Eski DAAK kamera kopyası temizlendi: " .. name)
+        end
+    end
+end
+
 local function ensure_main_scene(name)
     local scene = obs.obs_get_scene_by_name(name)
     if scene ~= nil then
@@ -368,6 +395,7 @@ end
 
 local function ensure_sources_and_scenes()
     local values = read_local_camera_config()
+    remove_legacy_camera_duplicates()
     local screen = ensure_screen_source(values)
     local phone = ensure_camera_source(phone_source_name, values.phone_camera_id, values.phone_camera_name)
     local mac = ensure_camera_source(mac_source_name, values.mac_camera_id, values.mac_camera_name)
