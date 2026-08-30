@@ -2527,11 +2527,26 @@ private struct BroadcastStatus: Decodable {
     let effectiveQuality: String?
     let layout: String?
     let verticalLayout: String?
+    let captureMode: String?
     let studioReady: Bool?
     let cameraReady: Bool?
     let privacyReady: Bool?
     let captureWindowID: Int?
     let captureWindowOwner: String?
+}
+
+private enum BroadcastCaptureMode: String, CaseIterable, Identifiable {
+    case window
+    case display
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .window: return "Tek pencere"
+        case .display: return "Tüm ekran"
+        }
+    }
 }
 
 private enum BroadcastQuality: String, CaseIterable, Identifiable {
@@ -2605,6 +2620,7 @@ private final class BroadcastMonitor: ObservableObject {
     @Published private(set) var selectedQuality: BroadcastQuality = .quadHD
     @Published private(set) var selectedLayout: BroadcastLayout = .studio
     @Published private(set) var selectedVerticalLayout: BroadcastVerticalLayout = .screenPhone
+    @Published private(set) var selectedCaptureMode: BroadcastCaptureMode = .window
     @Published private(set) var selectedWindowID: Int?
     @Published private(set) var availableWindows: [BroadcastWindowOption] = []
 
@@ -2640,6 +2656,10 @@ private final class BroadcastMonitor: ObservableObject {
            let selected = BroadcastVerticalLayout(rawValue: layout) {
             selectedVerticalLayout = selected
         }
+        if let mode = decoded.captureMode,
+           let selected = BroadcastCaptureMode(rawValue: mode) {
+            selectedCaptureMode = selected
+        }
         selectedWindowID = decoded.captureWindowID
         refreshWindows()
         message = decoded.streaming ? "Canlı SRT akışı Intel Mac'e ulaşıyor." : routeMessage(decoded)
@@ -2672,6 +2692,15 @@ private final class BroadcastMonitor: ObservableObject {
             "vertical",
             arguments: [layout.rawValue],
             progress: "\(layout.title) dikey düzeni kaydediliyor…"
+        )
+    }
+
+    func setCaptureMode(_ mode: BroadcastCaptureMode) async {
+        guard status?.streaming != true else { return }
+        await perform(
+            "capture",
+            arguments: [mode.rawValue],
+            progress: "\(mode.title) yakalama modu hazırlanıyor…"
         )
     }
 
@@ -2735,7 +2764,11 @@ private final class BroadcastMonitor: ObservableObject {
     }
 
     private func routeMessage(_ value: BroadcastStatus) -> String {
-        if value.privacyReady != true { return "Önce yalnız yayında görünecek güvenli pencereyi seç." }
+        if value.privacyReady != true {
+            return value.captureMode == BroadcastCaptureMode.display.rawValue
+                ? "Tüm ekran hedefi hazır değil."
+                : "Önce yalnız yayında görünecek güvenli pencereyi seç."
+        }
         if value.route == "offline" { return "Intel erişilemiyor; yerel OBS kullanılabilir." }
         if value.receiver == "idle" { return "Intel alıcısı henüz hazır değil." }
         if value.receiver == "receiving" { return "Intel alıyor ve VideoToolbox ile işliyor." }
@@ -2769,9 +2802,14 @@ private struct BroadcastView: View {
                     GridRow { Text("Açık kaynak stüdyo").foregroundStyle(.secondary); Text(status.studioReady == true ? "Aitum hazır" : "Eklenti eksik") }
                     GridRow { Text("Kameralar").foregroundStyle(.secondary); Text(status.cameraReady == true ? "M3 + telefon hazır" : "Yapılandırılmadı") }
                     GridRow {
-                        Text("Mahremiyet kilidi").foregroundStyle(.secondary)
-                        Text(status.privacyReady == true ? "Yalnız pencere · hazır" : "Pencere seçilmeli")
-                            .foregroundStyle(status.privacyReady == true ? Color.green : Color.orange)
+                        Text("Yakalama").foregroundStyle(.secondary)
+                        if status.captureMode == BroadcastCaptureMode.display.rawValue {
+                            Text(status.privacyReady == true ? "Tüm ekran · dikkat" : "Tüm ekran hedefi eksik")
+                                .foregroundStyle(Color.orange)
+                        } else {
+                            Text(status.privacyReady == true ? "Tek pencere · hazır" : "Pencere seçilmeli")
+                                .foregroundStyle(status.privacyReady == true ? Color.green : Color.orange)
+                        }
                     }
                 }
                 .font(.callout)
@@ -2796,27 +2834,52 @@ private struct BroadcastView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Yayında görünecek tek pencere")
+                Text("Ekran yakalama")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Picker(
-                    "Güvenli yayın penceresi",
-                    selection: Binding<Int?>(
-                        get: { monitor.selectedWindowID },
-                        set: { windowID in
-                            guard let windowID,
-                                  let window = monitor.availableWindows.first(where: { $0.id == windowID }) else { return }
-                            Task { await monitor.setCaptureWindow(window) }
-                        }
+                    "Ekran yakalama modu",
+                    selection: Binding(
+                        get: { monitor.selectedCaptureMode },
+                        set: { mode in Task { await monitor.setCaptureMode(mode) } }
                     )
                 ) {
-                    Text("Pencere seç").tag(Int?.none)
-                    ForEach(monitor.availableWindows) { window in
-                        Text(window.label).lineLimit(1).tag(Optional(window.id))
+                    ForEach(BroadcastCaptureMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
                     }
                 }
                 .labelsHidden()
+                .pickerStyle(.segmented)
                 .disabled(monitor.isWorking || monitor.status?.streaming == true)
+
+                if monitor.selectedCaptureMode == .window {
+                    Picker(
+                        "Güvenli yayın penceresi",
+                        selection: Binding<Int?>(
+                            get: { monitor.selectedWindowID },
+                            set: { windowID in
+                                guard let windowID,
+                                      let window = monitor.availableWindows.first(where: { $0.id == windowID }) else { return }
+                                Task { await monitor.setCaptureWindow(window) }
+                            }
+                        )
+                    ) {
+                        Text("Pencere seç").tag(Int?.none)
+                        ForEach(monitor.availableWindows) { window in
+                            Text(window.label).lineLimit(1).tag(Optional(window.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .disabled(monitor.isWorking || monitor.status?.streaming == true)
+                } else {
+                    Label(
+                        "Tüm ekran menü barını, Dock'u, masaüstü dosyalarını ve bildirimleri gösterebilir.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
 
                 Text("Yayın düzeni")
                     .font(.caption.weight(.semibold))
@@ -2877,7 +2940,7 @@ private struct BroadcastView: View {
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(monitor.status?.route == "direct" ? Color.green : Color.secondary)
 
-            Text("OBS yalnız seçilen bağımsız pencereyi yakalar; menü barı, Dock ve masaüstü hiçbir zaman tam ekran kaynağı olarak kullanılmaz. Hedef pencere kapanırsa görüntü siyaha düşer. Dikey tuval ekran + telefon, ekran + webcam veya üçlü seçilebilir.")
+            Text("Tek pencere güvenli varsayılandır; hedef kapanırsa görüntü siyaha düşer. Tüm ekran yalnız sen seçtiğinde açılır. Yatayda ekran, telefon veya M3 kamera sahnesine geçtiğinde dikey yayın da aynı kaynağa geçer; stüdyo sahnesi kayıtlı ikili/üçlü dikey düzeni kullanır.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

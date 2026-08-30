@@ -10,6 +10,8 @@ local phone_source_name = "DAAK Telefon Kamerası"
 local mac_source_name = "DAAK M3 Kamerası"
 
 local setup_timer_active = false
+local sync_timer_active = false
+local display_uuid = ""
 
 local function read_local_camera_config()
     local values = {}
@@ -64,6 +66,22 @@ local function selected_vertical_layout()
     return "screen-phone"
 end
 
+local function selected_capture_mode()
+    local home = os.getenv("HOME")
+    if home == nil then
+        return "window"
+    end
+    local handle = io.open(home .. "/Library/Application Support/DAAK/Broadcast/capture-mode-profile", "r")
+    if handle ~= nil then
+        local mode = handle:read("*l")
+        handle:close()
+        if mode == "display" then
+            return mode
+        end
+    end
+    return "window"
+end
+
 local function matching_window_id(source, values)
     local configured = tonumber(values.capture_window_id or "") or 0
     local owner = values.capture_window_owner or ""
@@ -92,26 +110,42 @@ end
 
 local function ensure_screen_source(values)
     local source = obs.obs_get_source_by_name(screen_source_name)
+    local mode = selected_capture_mode()
     if source == nil then
         local settings = obs.obs_data_create()
-        obs.obs_data_set_int(settings, "type", 1)
-        obs.obs_data_set_int(settings, "window", tonumber(values.capture_window_id or "") or 0)
+        if mode == "display" then
+            obs.obs_data_set_int(settings, "type", 0)
+            obs.obs_data_set_string(settings, "display_uuid", display_uuid)
+        else
+            obs.obs_data_set_int(settings, "type", 1)
+            obs.obs_data_set_int(settings, "window", tonumber(values.capture_window_id or "") or 0)
+        end
         obs.obs_data_set_bool(settings, "show_cursor", true)
         obs.obs_data_set_bool(settings, "hide_obs", true)
         obs.obs_data_set_bool(settings, "show_empty_names", false)
-        obs.obs_data_set_bool(settings, "show_hidden_windows", true)
+        obs.obs_data_set_bool(settings, "show_hidden_windows", false)
         source = obs.obs_source_create("screen_capture", screen_source_name, settings, nil)
         obs.obs_data_release(settings)
         return source
     end
     local settings = obs.obs_source_get_settings(source)
-    obs.obs_data_set_int(settings, "type", 1)
-    obs.obs_data_set_int(settings, "window", matching_window_id(source, values))
-    obs.obs_data_erase(settings, "display_uuid")
+    if mode == "display" then
+        local selected_display_uuid = display_uuid
+        if selected_display_uuid == "" then
+            selected_display_uuid = obs.obs_data_get_string(settings, "display_uuid")
+        end
+        obs.obs_data_set_int(settings, "type", 0)
+        obs.obs_data_set_string(settings, "display_uuid", selected_display_uuid)
+        obs.obs_data_erase(settings, "window")
+    else
+        obs.obs_data_set_int(settings, "type", 1)
+        obs.obs_data_set_int(settings, "window", matching_window_id(source, values))
+        obs.obs_data_erase(settings, "display_uuid")
+    end
     obs.obs_data_set_bool(settings, "show_cursor", true)
     obs.obs_data_set_bool(settings, "hide_obs", true)
     obs.obs_data_set_bool(settings, "show_empty_names", false)
-    obs.obs_data_set_bool(settings, "show_hidden_windows", true)
+    obs.obs_data_set_bool(settings, "show_hidden_windows", false)
     obs.obs_source_update(source, settings)
     obs.obs_data_release(settings)
     return source
@@ -140,12 +174,11 @@ local function ensure_camera_source(source_name, device_id, device_name)
 end
 
 local function ensure_main_scene(name)
-    local source = obs.obs_get_source_by_name(name)
-    if source ~= nil then
-        local scene = obs.obs_scene_from_source(source)
-        return scene, source, false
+    local scene = obs.obs_get_scene_by_name(name)
+    if scene ~= nil then
+        return scene, nil, false
     end
-    local scene = obs.obs_scene_create(name)
+    scene = obs.obs_scene_create(name)
     return scene, nil, true
 end
 
@@ -227,7 +260,28 @@ local function configure_studio_scenes(screen, phone, mac)
     end
 end
 
-local function configure_vertical_scene(screen, phone, mac)
+local function current_vertical_layout()
+    local transition = obs.obs_get_output_source(0)
+    if transition == nil then
+        return selected_vertical_layout(), ""
+    end
+    local current = obs.obs_transition_get_active_source(transition)
+    local name = obs.obs_source_get_name(current or transition)
+    if current ~= nil then
+        obs.obs_source_release(current)
+    end
+    obs.obs_source_release(transition)
+    if name == screen_scene_name then
+        return "screen-only", name
+    elseif name == phone_scene_name then
+        return "phone-only", name
+    elseif name == mac_scene_name then
+        return "mac-only", name
+    end
+    return selected_vertical_layout(), name
+end
+
+local function configure_vertical_scene(screen, phone, mac, layout)
     local canvas = obs.obs_get_canvas_by_name("Aitum Vertical")
     if canvas == nil then
         obs.script_log(obs.LOG_WARNING, "Aitum Vertical tuvali henüz hazır değil")
@@ -240,8 +294,23 @@ local function configure_vertical_scene(screen, phone, mac)
         return false
     end
     local scene = obs.obs_scene_from_source(scene_source)
-    local layout = selected_vertical_layout()
-    if layout == "triple" then
+    if layout == "screen-only" then
+        set_item(scene, screen, 0, 0, 1080, 1920, obs.OBS_BOUNDS_SCALE_INNER)
+        set_item_visibility(scene, phone, false)
+        set_item_visibility(scene, mac, false)
+    elseif layout == "phone-only" then
+        set_item_visibility(scene, screen, false)
+        if phone ~= nil then
+            set_item(scene, phone, 0, 0, 1080, 1920, obs.OBS_BOUNDS_SCALE_OUTER)
+        end
+        set_item_visibility(scene, mac, false)
+    elseif layout == "mac-only" then
+        set_item_visibility(scene, screen, false)
+        set_item_visibility(scene, phone, false)
+        if mac ~= nil then
+            set_item(scene, mac, 0, 0, 1080, 1920, obs.OBS_BOUNDS_SCALE_OUTER)
+        end
+    elseif layout == "triple" then
         set_item(scene, screen, 0, 0, 1080, 608, obs.OBS_BOUNDS_SCALE_INNER)
         if phone ~= nil then
             set_item(scene, phone, 0, 608, 1080, 720, obs.OBS_BOUNDS_SCALE_OUTER)
@@ -268,6 +337,38 @@ local function configure_vertical_scene(screen, phone, mac)
     return true
 end
 
+local function sync_vertical_scene()
+    if sync_timer_active then
+        obs.timer_remove(sync_vertical_scene)
+        sync_timer_active = false
+    end
+    local screen = obs.obs_get_source_by_name(screen_source_name)
+    local phone = obs.obs_get_source_by_name(phone_source_name)
+    local mac = obs.obs_get_source_by_name(mac_source_name)
+    if screen == nil then
+        if phone ~= nil then obs.obs_source_release(phone) end
+        if mac ~= nil then obs.obs_source_release(mac) end
+        return
+    end
+    local layout, horizontal_name = current_vertical_layout()
+    if configure_vertical_scene(screen, phone, mac, layout) then
+        obs.script_log(obs.LOG_INFO, "DAAK yatay sahne eşlemesi: " .. horizontal_name .. " -> " .. layout)
+    end
+    obs.obs_source_release(screen)
+    if phone ~= nil then obs.obs_source_release(phone) end
+    if mac ~= nil then obs.obs_source_release(mac) end
+end
+
+local function on_frontend_event(event)
+    if event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
+        if sync_timer_active then
+            obs.timer_remove(sync_vertical_scene)
+        end
+        sync_timer_active = true
+        obs.timer_add(sync_vertical_scene, 150)
+    end
+end
+
 local function ensure_sources_and_scenes()
     local values = read_local_camera_config()
     local screen = ensure_screen_source(values)
@@ -280,13 +381,15 @@ local function ensure_sources_and_scenes()
     end
 
     configure_studio_scenes(screen, phone, mac)
-    local vertical_ready = configure_vertical_scene(screen, phone, mac)
+    local layout, horizontal_name = current_vertical_layout()
+    local vertical_ready = configure_vertical_scene(screen, phone, mac, layout)
 
     obs.obs_source_release(screen)
     if phone ~= nil then obs.obs_source_release(phone) end
     if mac ~= nil then obs.obs_source_release(mac) end
 
     if vertical_ready then
+        obs.script_log(obs.LOG_INFO, "DAAK yatay sahne eşlemesi: " .. horizontal_name .. " -> " .. layout)
         obs.script_log(obs.LOG_INFO, "DAAK yatay/dikey kamera stüdyosu hazır")
         obs.timer_remove(ensure_sources_and_scenes)
         setup_timer_active = false
@@ -298,12 +401,18 @@ function script_description()
 end
 
 function script_load(settings)
+    display_uuid = obs.obs_data_get_string(settings, "display_uuid")
+    obs.obs_frontend_add_event_callback(on_frontend_event)
     setup_timer_active = true
     obs.timer_add(ensure_sources_and_scenes, 1500)
 end
 
 function script_unload()
+    obs.obs_frontend_remove_event_callback(on_frontend_event)
     if setup_timer_active then
         obs.timer_remove(ensure_sources_and_scenes)
+    end
+    if sync_timer_active then
+        obs.timer_remove(sync_vertical_scene)
     end
 end
