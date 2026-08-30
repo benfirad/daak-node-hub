@@ -33,3 +33,16 @@ bundle in `/Applications`, and relaunches itself. Device-specific configuration 
 The bottom of the menu shows the installed version and commit, plus a manual
 **Kontrol et** / **Güncelle** action. Automatic checks do not download or rebuild
 anything while the installed commit already matches `main`.
+
+## Broadcast quality
+
+The **Yayın** panel can persistently select either **1080p60** or **1440p60**
+before a broadcast starts. The bundled controller applies the matching OBS
+canvas, output resolution, scene bounds, and Thunderbolt intermediate bitrate
+atomically. Quality changes are disabled while a stream is active. The
+Tailscale fallback remains a separate 1080p30 profile.
+
+The app bundle also carries the matching Intel receiver script for reviewed
+deployment to MYA-L11. Device addresses, credentials, OBS profiles, scene
+collections, and broadcast keys remain local runtime configuration and are not
+committed.

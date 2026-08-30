@@ -2522,6 +2522,29 @@ private struct BroadcastStatus: Decodable {
     let receiver: String
     let ready: Bool
     let streaming: Bool
+    let quality: String?
+    let effectiveQuality: String?
+}
+
+private enum BroadcastQuality: String, CaseIterable, Identifiable {
+    case fullHD = "1080p60"
+    case quadHD = "1440p60"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fullHD: return "1080p60"
+        case .quadHD: return "1440p60"
+        }
+    }
+
+    var specification: String {
+        switch self {
+        case .fullHD: return "40 Mb/sn ara akış · 30 Mb/sn Intel master"
+        case .quadHD: return "80 Mb/sn ara akış · 50 Mb/sn Intel master"
+        }
+    }
 }
 
 @MainActor
@@ -2529,8 +2552,12 @@ private final class BroadcastMonitor: ObservableObject {
     @Published private(set) var status: BroadcastStatus?
     @Published private(set) var isWorking = false
     @Published private(set) var message = "Yayın yolu denetleniyor."
+    @Published private(set) var selectedQuality: BroadcastQuality = .quadHD
 
-    private let script = NSHomeDirectory() + "/Library/Application Support/DAAK/Broadcast/daak-broadcast-control.zsh"
+    private var script: String {
+        Bundle.main.path(forResource: "daak-broadcast-control", ofType: "zsh")
+            ?? NSHomeDirectory() + "/Library/Application Support/DAAK/Broadcast/daak-broadcast-control.zsh"
+    }
 
     init() {
         Task { await refresh() }
@@ -2547,18 +2574,30 @@ private final class BroadcastMonitor: ObservableObject {
             return
         }
         status = decoded
+        if let quality = decoded.quality,
+           let selected = BroadcastQuality(rawValue: quality) {
+            selectedQuality = selected
+        }
         message = decoded.streaming ? "Canlı SRT akışı Intel Mac'e ulaşıyor." : routeMessage(decoded)
     }
 
     func start() async { await perform("start", progress: "Yayın yolu başlatılıyor…") }
     func stop() async { await perform("stop", progress: "Yayın durduruluyor…") }
     func openLocal() async { await perform("local", progress: "M3 OBS açılıyor…") }
+    func setQuality(_ quality: BroadcastQuality) async {
+        guard status?.streaming != true else { return }
+        await perform(
+            "quality",
+            arguments: [quality.rawValue],
+            progress: "\(quality.title) profili uygulanıyor…"
+        )
+    }
 
-    private func perform(_ action: String, progress: String) async {
+    private func perform(_ action: String, arguments: [String] = [], progress: String) async {
         guard !isWorking else { return }
         isWorking = true
         message = progress
-        let result = await LocalCommand.run(script, [action])
+        let result = await LocalCommand.run(script, [action] + arguments)
         isWorking = false
         if result.exitCode != 0 {
             message = result.output.isEmpty ? "Yayın komutu çalışmadı." : result.output
@@ -2621,18 +2660,45 @@ private struct BroadcastView: View {
                 .accessibilityLabel("Yayın durumunu yenile")
             }
 
-            Label("Thunderbolt · 1080p60 · 25 Mb/sn · MTU 9000", systemImage: "bolt.horizontal.fill")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Yayın kalitesi")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Yayın kalitesi",
+                    selection: Binding(
+                        get: { monitor.selectedQuality },
+                        set: { quality in Task { await monitor.setQuality(quality) } }
+                    )
+                ) {
+                    ForEach(BroadcastQuality.allCases) { quality in
+                        Text(quality.title).tag(quality)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(monitor.isWorking || monitor.status?.streaming == true)
+            }
+
+            Label(profileSummary, systemImage: "bolt.horizontal.fill")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(monitor.status?.route == "direct" ? Color.green : Color.secondary)
 
-            Text("Thunderbolt bağlıysa doğrudan, düşük gecikmeli SRT yolu kullanılır; kablo ayrılırsa Tailscale 1080p30 rotasına otomatik geçilir. Platform hesabı ve yayın anahtarı yalnız Intel tarafında kalır.")
+            Text("Kalite yayın kapalıyken değiştirilebilir ve yeniden başlatmalarda korunur. Thunderbolt ayrılırsa Tailscale 1080p30 rotasına otomatik geçilir. Platform hesabı ve yayın anahtarı yalnız Intel tarafında kalır.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 330, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 390, alignment: .topLeading)
         .task { await monitor.refresh() }
+    }
+
+    private var profileSummary: String {
+        if monitor.status?.route == "tailscale" {
+            return "Tailscale · 1080p30 · 8 Mb/sn ara akış"
+        }
+        return "Thunderbolt · \(monitor.selectedQuality.title) · \(monitor.selectedQuality.specification) · MTU 9000"
     }
 
     private func routeLabel(_ value: String) -> String {
