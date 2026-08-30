@@ -2824,6 +2824,11 @@ private struct BroadcastView: View {
                     .disabled(monitor.isWorking)
                 Button("OBS Stüdyo") { Task { await monitor.openLocal() } }
                     .buttonStyle(.bordered)
+                Button("Companion") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Companion.app"))
+                }
+                .buttonStyle(.bordered)
+                .help("Açık kaynak Bitfocus Companion kontrol yüzeyini aç")
                 Spacer()
                 Button { Task { await monitor.refresh() } } label: {
                     Image(systemName: "arrow.clockwise")

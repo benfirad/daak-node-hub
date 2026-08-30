@@ -176,10 +176,9 @@ end
 local function ensure_main_scene(name)
     local scene = obs.obs_get_scene_by_name(name)
     if scene ~= nil then
-        return scene, nil, false
+        return scene
     end
-    scene = obs.obs_scene_create(name)
-    return scene, nil, true
+    return obs.obs_scene_create(name)
 end
 
 local function set_item(scene, source, x, y, width, height, bounds_type)
@@ -215,10 +214,8 @@ local function set_item_visibility(scene, source, visible)
     end
 end
 
-local function release_scene(scene, source, created)
-    if source ~= nil then
-        obs.obs_source_release(source)
-    elseif created and scene ~= nil then
+local function release_scene(scene)
+    if scene ~= nil then
         obs.obs_scene_release(scene)
     end
 end
@@ -227,11 +224,11 @@ local function configure_studio_scenes(screen, phone, mac)
     local width, height = selected_size()
     local margin = math.floor(width * 0.01875)
 
-    local scene, source, created = ensure_main_scene(screen_scene_name)
+    local scene = ensure_main_scene(screen_scene_name)
     set_item(scene, screen, 0, 0, width, height, obs.OBS_BOUNDS_SCALE_INNER)
-    release_scene(scene, source, created)
+    release_scene(scene)
 
-    scene, source, created = ensure_main_scene(studio_scene_name)
+    scene = ensure_main_scene(studio_scene_name)
     set_item(scene, screen, 0, 0, width, height, obs.OBS_BOUNDS_SCALE_INNER)
     if phone ~= nil then
         local camera_width = math.floor(width * 0.34)
@@ -245,18 +242,18 @@ local function configure_studio_scenes(screen, phone, mac)
         set_item(scene, mac, margin, height - camera_height - margin,
                  camera_width, camera_height, obs.OBS_BOUNDS_SCALE_OUTER)
     end
-    release_scene(scene, source, created)
+    release_scene(scene)
 
     if phone ~= nil then
-        scene, source, created = ensure_main_scene(phone_scene_name)
+        scene = ensure_main_scene(phone_scene_name)
         set_item(scene, phone, 0, 0, width, height, obs.OBS_BOUNDS_SCALE_OUTER)
-        release_scene(scene, source, created)
+        release_scene(scene)
     end
 
     if mac ~= nil then
-        scene, source, created = ensure_main_scene(mac_scene_name)
+        scene = ensure_main_scene(mac_scene_name)
         set_item(scene, mac, 0, 0, width, height, obs.OBS_BOUNDS_SCALE_OUTER)
-        release_scene(scene, source, created)
+        release_scene(scene)
     end
 end
 
