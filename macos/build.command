@@ -37,6 +37,7 @@ cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/update-daak-node.zsh" "$RESOURCES_DIR/update-daak-node.zsh"
 cp "$ROOT/Resources/daak-broadcast-control.zsh" "$RESOURCES_DIR/daak-broadcast-control.zsh"
 cp "$ROOT/Resources/daak-broadcast-receiver.zsh" "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
+cp "$ROOT/Resources/create_m3_scene.lua" "$RESOURCES_DIR/create_m3_scene.lua"
 chmod 755 "$RESOURCES_DIR/update-daak-node.zsh" \
   "$RESOURCES_DIR/daak-broadcast-control.zsh" \
   "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
