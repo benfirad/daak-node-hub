@@ -80,3 +80,12 @@ scene uses the saved two-source or three-source vertical arrangement.
 Recommended routing is landscape for Twitch, landscape plus YouTube's native
 dual-stream option when available, and the dedicated 9:16 canvas for TikTok.
 Platform stream keys are entered locally in OBS/Aitum and must never be committed.
+
+## Optional open-source control surface
+
+The DAAK Node broadcast panel can open the separately installed open-source
+Bitfocus Companion application as an optional shotbox/control interface. DAAK's
+fixed start/stop, capture safety, quality, and Thunderbolt fallback logic remains
+authoritative. Companion shell-command and restricted-module features stay off;
+OBS WebSocket authentication is configured manually and no credential is stored
+in this repository.
