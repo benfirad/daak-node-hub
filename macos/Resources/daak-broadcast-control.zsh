@@ -6,8 +6,12 @@ PID_FILE="$ROOT/m3-obs.pid"
 RELAY_PID_FILE="$ROOT/m3-srt-relay.pid"
 STATE_FILE="$ROOT/state.json"
 QUALITY_FILE="$ROOT/quality-profile"
+LAYOUT_FILE="$ROOT/layout-profile"
+CAMERA_CONFIG="$ROOT/camera-sources.conf"
+CAMERA_SCRIPT="$ROOT/scripts/create_m3_scene.lua"
 OBS_PROFILE="$HOME/Library/Application Support/obs-studio/basic/profiles/DAAK Sender Thunderbolt/basic.ini"
 OBS_SCENE="$HOME/Library/Application Support/obs-studio/basic/scenes/DAAK M3 Sender.json"
+OBS_PLUGINS="$HOME/Library/Application Support/obs-studio/plugins"
 RELAY="$ROOT/bin/daak-srt-relay"
 NODE_CONFIG="$HOME/Library/Application Support/DAAK/node-config.json"
 RECEIVER_COMMAND='$HOME/Library/Application\ Support/DAAK/Broadcast/daak-broadcast-receiver.zsh'
@@ -33,6 +37,25 @@ PY
 DIRECT_HOST="${DAAK_BROADCAST_DIRECT_HOST:-$(configured_host thunderboltHost 2>/dev/null || true)}"
 TAIL_HOST="${DAAK_BROADCAST_TAIL_HOST:-$(configured_host tailHost 2>/dev/null || true)}"
 
+sync_camera_script() {
+  local source="${0:A:h}/create_m3_scene.lua"
+  [[ -f "$source" ]] || return 0
+  /bin/mkdir -p "${CAMERA_SCRIPT:h}"
+  if [[ ! -f "$CAMERA_SCRIPT" ]] || ! /usr/bin/cmp -s "$source" "$CAMERA_SCRIPT"; then
+    /bin/cp "$source" "$CAMERA_SCRIPT"
+  fi
+}
+
+studio_ready() {
+  [[ -d "$OBS_PLUGINS/vertical-canvas.plugin" && -d "$OBS_PLUGINS/aitum-multistream.plugin" ]]
+}
+
+camera_ready() {
+  [[ -f "$CAMERA_CONFIG" && -f "$CAMERA_SCRIPT" ]] || return 1
+  /usr/bin/grep -Eq '^mac_camera_id=.+' "$CAMERA_CONFIG" && \
+    /usr/bin/grep -Eq '^phone_camera_id=.+' "$CAMERA_CONFIG"
+}
+
 route() {
   if [[ -n "$DIRECT_HOST" ]] && /usr/bin/nc -z -G 1 "$DIRECT_HOST" 22 >/dev/null 2>&1; then
     print -r -- direct
@@ -50,6 +73,42 @@ quality_selection() {
     1080p60|1440p60) print -r -- "$selected" ;;
     *) print -r -- 1440p60 ;;
   esac
+}
+
+layout_selection() {
+  local selected="studio"
+  [[ -f "$LAYOUT_FILE" ]] && selected="$(<"$LAYOUT_FILE")"
+  case "$selected" in
+    screen|studio|phone|mac) print -r -- "$selected" ;;
+    *) print -r -- studio ;;
+  esac
+}
+
+layout_scene() {
+  case "${1:-$(layout_selection)}" in
+    screen) print -r -- "DAAK M3 Ekran" ;;
+    phone) print -r -- "DAAK Telefon Tam" ;;
+    mac) print -r -- "DAAK M3 Kamera Tam" ;;
+    *) print -r -- "DAAK Ekran + Kameralar" ;;
+  esac
+}
+
+set_layout() {
+  local requested="${1:-}" temporary
+  case "$requested" in
+    screen|studio|phone|mac) ;;
+    *) print -u2 -- "layout must be screen, studio, phone, or mac"; return 64 ;;
+  esac
+  running_pid >/dev/null 2>&1 && {
+    print -u2 -- "stop the broadcast before changing layout"
+    return 1
+  }
+  /bin/mkdir -p "$ROOT"
+  temporary="$LAYOUT_FILE.$$"
+  print -r -- "$requested" > "$temporary"
+  /bin/mv "$temporary" "$LAYOUT_FILE"
+  write_state stopped "$(route)" "Yayın düzeni $(layout_scene "$requested") olarak ayarlandı."
+  print -r -- "{\"layout\":\"$requested\"}"
 }
 
 apply_direct_quality() {
@@ -194,6 +253,19 @@ sender_connected() {
     /usr/bin/grep -F -- ' UDP ' >/dev/null
 }
 
+terminate_obs_pid() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  /bin/ps -p "$pid" -o command= | /usr/bin/grep -F -- "--collection DAAK M3 Sender" >/dev/null || return 0
+  /bin/kill -TERM "$pid" 2>/dev/null || return 0
+  for _ in {1..20}; do
+    /bin/kill -0 "$pid" 2>/dev/null || return 0
+    /bin/sleep 0.25
+  done
+  /bin/ps -p "$pid" -o command= | /usr/bin/grep -F -- "--collection DAAK M3 Sender" >/dev/null || return 0
+  /bin/kill -KILL "$pid" 2>/dev/null || true
+}
+
 start_relay() {
   local selected="$1" host="$DIRECT_HOST" latency=80 pid
   [[ "$selected" == tailscale ]] && { host="$TAIL_HOST"; latency=180; }
@@ -228,21 +300,24 @@ PY
 }
 
 status() {
-  local selected sender receiver="unknown" quality effective
+  local selected sender receiver="unknown" quality effective layout studio=false cameras=false
   selected="$(route)"
   quality="$(quality_selection)"
+  layout="$(layout_selection)"
   effective="$quality"
   [[ "$selected" == tailscale ]] && effective=1080p30
   sender="$(sender_state)"
+  studio_ready && studio=true
+  camera_ready && cameras=true
   if [[ "$selected" != offline ]]; then
     receiver="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 "$(ssh_host "$selected")" \
       "$RECEIVER_COMMAND status" 2>/dev/null || print -r -- '{"state":"unknown"}')"
   else
     receiver='{"state":"offline"}'
   fi
-  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" <<'PY'
+  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" "$layout" "$studio" "$cameras" <<'PY'
 import json, sys, time
-route, sender, receiver_raw, quality, effective = sys.argv[1:]
+route, sender, receiver_raw, quality, effective, layout, studio, cameras = sys.argv[1:]
 try:
     receiver = json.loads(receiver_raw).get("state", "unknown")
 except Exception:
@@ -256,15 +331,19 @@ print(json.dumps({
     "streaming": sender == "streaming" and receiver in {"listening", "receiving"},
     "quality": quality,
     "effectiveQuality": effective,
+    "layout": layout,
+    "studioReady": studio == "true",
+    "cameraReady": cameras == "true",
     "updatedAt": time.time()
 }, separators=(",", ":")))
 PY
 }
 
 start_split() {
-  local selected="$1" remote profile pid="" quality effective
+  local selected="$1" remote profile pid="" quality effective layout
   remote="$(ssh_host "$selected")"
   quality="$(quality_selection)"
+  layout="$(layout_selection)"
   effective="$quality"
   profile="DAAK Sender Thunderbolt"
   if [[ "$selected" == tailscale ]]; then
@@ -273,6 +352,7 @@ start_split() {
   else
     apply_direct_quality "$quality"
   fi
+  sync_camera_script
   /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
     "$RECEIVER_COMMAND start $effective" >/dev/null
   if [[ "$selected" == tailscale ]]; then
@@ -287,17 +367,13 @@ start_split() {
       print -r -- "{\"state\":\"streaming\",\"route\":\"$selected\"}"
       return
     fi
-    /bin/kill -TERM "$pid"
-    for _ in {1..20}; do
-      /bin/kill -0 "$pid" 2>/dev/null || break
-      /bin/sleep 0.25
-    done
+    terminate_obs_pid "$pid"
     /bin/rm -f "$PID_FILE"
   fi
   /bin/mkdir -p "$ROOT/logs"
   /usr/bin/open -na /Applications/OBS.app --args --multi --disable-updater \
-    --only-bundled-plugins --profile "$profile" --collection "DAAK M3 Sender" \
-    --scene "DAAK M3 Ekran" --startrecording
+    --profile "$profile" --collection "DAAK M3 Sender" \
+    --scene "$(layout_scene "$layout")" --startrecording
   pid=""
   for _ in {1..30}; do
     pid="$(/usr/bin/pgrep -n -f -- '--collection DAAK M3 Sender' 2>/dev/null || true)"
@@ -324,11 +400,7 @@ start_split() {
 stop_all() {
   local pid selected
   if pid="$(running_pid 2>/dev/null)"; then
-    /bin/kill -TERM "$pid"
-    for _ in {1..20}; do
-      /bin/kill -0 "$pid" 2>/dev/null || break
-      /bin/sleep 0.25
-    done
+    terminate_obs_pid "$pid"
   fi
   /bin/rm -f "$PID_FILE"
   if pid="$(relay_pid 2>/dev/null)"; then
@@ -346,6 +418,7 @@ stop_all() {
 }
 
 start_local() {
+  sync_camera_script
   /usr/bin/open -a /Applications/OBS.app
   write_state local offline "Intel erişilemiyor; yerel OBS açıldı."
   print -r -- '{"state":"local","route":"offline"}'
@@ -366,5 +439,12 @@ case "${1:-status}" in
       print -r -- "{\"quality\":\"$(quality_selection)\"}"
     fi
     ;;
-  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]}"; exit 64 ;;
+  layout)
+    if (( $# >= 2 )); then
+      set_layout "$2"
+    else
+      print -r -- "{\"layout\":\"$(layout_selection)\"}"
+    fi
+    ;;
+  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]|layout [screen|studio|phone|mac]}"; exit 64 ;;
 esac

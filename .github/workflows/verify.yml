@@ -49,4 +49,5 @@ jobs:
           test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/update-daak-node.zsh"
           test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/daak-broadcast-control.zsh"
           test -x "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/daak-broadcast-receiver.zsh"
+          test -f "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Resources/create_m3_scene.lua"
           test "$(/usr/libexec/PlistBuddy -c 'Print :DAAKSourceCommit' "$RUNNER_TEMP/daak-node-build/daakLOLILE.app/Contents/Info.plist")" = "$GITHUB_SHA"

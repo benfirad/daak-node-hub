@@ -2524,6 +2524,9 @@ private struct BroadcastStatus: Decodable {
     let streaming: Bool
     let quality: String?
     let effectiveQuality: String?
+    let layout: String?
+    let studioReady: Bool?
+    let cameraReady: Bool?
 }
 
 private enum BroadcastQuality: String, CaseIterable, Identifiable {
@@ -2547,12 +2550,31 @@ private enum BroadcastQuality: String, CaseIterable, Identifiable {
     }
 }
 
+private enum BroadcastLayout: String, CaseIterable, Identifiable {
+    case screen
+    case studio
+    case phone
+    case mac
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .screen: return "Ekran"
+        case .studio: return "Stüdyo"
+        case .phone: return "Telefon"
+        case .mac: return "M3 kamera"
+        }
+    }
+}
+
 @MainActor
 private final class BroadcastMonitor: ObservableObject {
     @Published private(set) var status: BroadcastStatus?
     @Published private(set) var isWorking = false
     @Published private(set) var message = "Yayın yolu denetleniyor."
     @Published private(set) var selectedQuality: BroadcastQuality = .quadHD
+    @Published private(set) var selectedLayout: BroadcastLayout = .studio
 
     private var script: String {
         Bundle.main.path(forResource: "daak-broadcast-control", ofType: "zsh")
@@ -2578,6 +2600,10 @@ private final class BroadcastMonitor: ObservableObject {
            let selected = BroadcastQuality(rawValue: quality) {
             selectedQuality = selected
         }
+        if let layout = decoded.layout,
+           let selected = BroadcastLayout(rawValue: layout) {
+            selectedLayout = selected
+        }
         message = decoded.streaming ? "Canlı SRT akışı Intel Mac'e ulaşıyor." : routeMessage(decoded)
     }
 
@@ -2590,6 +2616,15 @@ private final class BroadcastMonitor: ObservableObject {
             "quality",
             arguments: [quality.rawValue],
             progress: "\(quality.title) profili uygulanıyor…"
+        )
+    }
+
+    func setLayout(_ layout: BroadcastLayout) async {
+        guard status?.streaming != true else { return }
+        await perform(
+            "layout",
+            arguments: [layout.rawValue],
+            progress: "\(layout.title) düzeni kaydediliyor…"
         )
     }
 
@@ -2638,6 +2673,8 @@ private struct BroadcastView: View {
                     GridRow { Text("Rota").foregroundStyle(.secondary); Text(routeLabel(status.route)).bold() }
                     GridRow { Text("M3 gönderici").foregroundStyle(.secondary); Text(stateLabel(status.sender)) }
                     GridRow { Text("Intel alıcı").foregroundStyle(.secondary); Text(stateLabel(status.receiver)) }
+                    GridRow { Text("Açık kaynak stüdyo").foregroundStyle(.secondary); Text(status.studioReady == true ? "Aitum hazır" : "Eklenti eksik") }
+                    GridRow { Text("Kameralar").foregroundStyle(.secondary); Text(status.cameraReady == true ? "M3 + telefon hazır" : "Yapılandırılmadı") }
                 }
                 .font(.callout)
             }
@@ -2649,7 +2686,7 @@ private struct BroadcastView: View {
                 Button("Durdur") { Task { await monitor.stop() } }
                     .buttonStyle(.bordered)
                     .disabled(monitor.isWorking)
-                Button("M3 OBS") { Task { await monitor.openLocal() } }
+                Button("OBS Stüdyo") { Task { await monitor.openLocal() } }
                     .buttonStyle(.bordered)
                 Spacer()
                 Button { Task { await monitor.refresh() } } label: {
@@ -2661,6 +2698,24 @@ private struct BroadcastView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
+                Text("Yayın düzeni")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Yayın düzeni",
+                    selection: Binding(
+                        get: { monitor.selectedLayout },
+                        set: { layout in Task { await monitor.setLayout(layout) } }
+                    )
+                ) {
+                    ForEach(BroadcastLayout.allCases) { layout in
+                        Text(layout.title).tag(layout)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(monitor.isWorking || monitor.status?.streaming == true)
+
                 Text("Yayın kalitesi")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -2684,13 +2739,13 @@ private struct BroadcastView: View {
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(monitor.status?.route == "direct" ? Color.green : Color.secondary)
 
-            Text("Kalite yayın kapalıyken değiştirilebilir ve yeniden başlatmalarda korunur. Thunderbolt ayrılırsa Tailscale 1080p30 rotasına otomatik geçilir. Platform hesabı ve yayın anahtarı yalnız Intel tarafında kalır.")
+            Text("Aitum Vertical ve Multistream OBS içinde yerel çalışır. M3 ile telefon kameraları yatay ve 9:16 sahnelerde hazırdır. Kalite yayın kapalıyken değiştirilebilir; Thunderbolt ayrılırsa Tailscale 1080p30 rotasına geçilir. Platform anahtarları kaynak koda veya RM-OS'a yazılmaz.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 390, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 500, alignment: .topLeading)
         .task { await monitor.refresh() }
     }
 

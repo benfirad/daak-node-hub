@@ -46,3 +46,22 @@ The app bundle also carries the matching Intel receiver script for reviewed
 deployment to MYA-L11. Device addresses, credentials, OBS profiles, scene
 collections, and broadcast keys remain local runtime configuration and are not
 committed.
+
+## Open-source studio and cameras
+
+The broadcast controller supports the GPL-2.0 Aitum Vertical Canvas and Aitum
+Multistream OBS plugins. It loads user-installed plugins, reports studio/camera
+readiness in DAAK Node, and bundles an idempotent Lua scene setup script. Camera
+device identifiers stay in the local
+`~/Library/Application Support/DAAK/Broadcast/camera-sources.conf` file.
+
+The generated layouts provide the screen-only scene, a landscape screen plus
+M3/phone camera scene, full-screen camera scenes, and a 1080x1920 Aitum Vertical
+scene. Camera audio is muted at the source to prevent echo; the existing desktop
+audio path remains unchanged. The DAAK Node panel persists **Screen**, **Studio**,
+**Phone**, or **M3 camera** as the next Intel-bound scene; S9 Deck start/stop
+actions use that same saved selection.
+
+Recommended routing is landscape for Twitch, landscape plus YouTube's native
+dual-stream option when available, and the dedicated 9:16 canvas for TikTok.
+Platform stream keys are entered locally in OBS/Aitum and must never be committed.
