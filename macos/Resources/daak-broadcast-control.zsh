@@ -41,6 +41,10 @@ TAIL_HOST="${DAAK_BROADCAST_TAIL_HOST:-$(configured_host tailHost 2>/dev/null ||
 
 sync_camera_script() {
   local source="${0:A:h}/create_m3_scene.lua"
+  local installed_source="/Applications/daakLOLILE.app/Contents/Resources/create_m3_scene.lua"
+  if [[ "${0:A:h}" == "$ROOT" && -f "$installed_source" ]]; then
+    source="$installed_source"
+  fi
   [[ -f "$source" ]] || return 0
   /bin/mkdir -p "${CAMERA_SCRIPT:h}"
   if [[ ! -f "$CAMERA_SCRIPT" ]] || ! /usr/bin/cmp -s "$source" "$CAMERA_SCRIPT"; then
