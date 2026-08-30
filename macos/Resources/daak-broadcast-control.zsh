@@ -8,6 +8,7 @@ STATE_FILE="$ROOT/state.json"
 QUALITY_FILE="$ROOT/quality-profile"
 LAYOUT_FILE="$ROOT/layout-profile"
 VERTICAL_LAYOUT_FILE="$ROOT/vertical-layout-profile"
+CAPTURE_MODE_FILE="$ROOT/capture-mode-profile"
 CAMERA_CONFIG="$ROOT/camera-sources.conf"
 CAMERA_SCRIPT="$ROOT/scripts/create_m3_scene.lua"
 OBS_PROFILE="$HOME/Library/Application Support/obs-studio/basic/profiles/DAAK Sender Thunderbolt/basic.ini"
@@ -103,6 +104,15 @@ vertical_layout_selection() {
   esac
 }
 
+capture_mode_selection() {
+  local selected="window"
+  [[ -f "$CAPTURE_MODE_FILE" ]] && selected="$(<"$CAPTURE_MODE_FILE")"
+  case "$selected" in
+    window|display) print -r -- "$selected" ;;
+    *) print -r -- window ;;
+  esac
+}
+
 any_obs_running() {
   /usr/bin/pgrep -x OBS >/dev/null 2>&1
 }
@@ -123,6 +133,30 @@ set_vertical_layout() {
   /bin/mv "$temporary" "$VERTICAL_LAYOUT_FILE"
   write_state stopped "$(route)" "Dikey yayın düzeni $requested olarak ayarlandı."
   print -r -- "{\"verticalLayout\":\"$requested\"}"
+}
+
+set_capture_mode() {
+  local requested="${1:-}" temporary
+  case "$requested" in
+    window|display) ;;
+    *) print -u2 -- "capture mode must be window or display"; return 64 ;;
+  esac
+  any_obs_running && {
+    print -u2 -- "OBS'yi kapatıp yakalama modunu tekrar seç"
+    return 1
+  }
+  /bin/mkdir -p "$ROOT"
+  temporary="$CAPTURE_MODE_FILE.$$"
+  print -r -- "$requested" > "$temporary"
+  /bin/mv "$temporary" "$CAPTURE_MODE_FILE"
+  if [[ "$requested" == display ]]; then
+    apply_capture_mode
+    write_state stopped "$(route)" "Tüm ekran yakalama modu seçildi; mahremiyet uyarısı etkin."
+  else
+    apply_capture_mode 2>/dev/null || true
+    write_state stopped "$(route)" "Güvenli tek pencere yakalama modu seçildi."
+  fi
+  print -r -- "{\"captureMode\":\"$requested\"}"
 }
 
 set_capture_window() {
@@ -182,7 +216,7 @@ except Exception:
         pass
     raise
 PY
-  apply_privacy_capture
+  apply_capture_mode
   write_state stopped "$(route)" "Güvenli pencere yakalama hedefi ayarlandı."
   print -r -- "{\"captureWindowID\":$window_id}"
 }
@@ -219,20 +253,21 @@ except Exception:
         pass
     raise
 PY
-  apply_privacy_capture 2>/dev/null || true
+  apply_capture_mode 2>/dev/null || true
   write_state stopped "$(route)" "Güvenli yayın penceresi seçimi temizlendi."
   print -r -- '{"captureWindowID":null}'
 }
 
-apply_privacy_capture() {
-  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" <<'PY'
+apply_capture_mode() {
+  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" "$(capture_mode_selection)" <<'PY'
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 
-config_path, scene_path = map(Path, sys.argv[1:])
+config_path, scene_path = map(Path, sys.argv[1:3])
+mode = sys.argv[3]
 values = {}
 if config_path.is_file():
     for line in config_path.read_text(encoding="utf-8").splitlines():
@@ -243,26 +278,39 @@ try:
     window_id = int(values.get("capture_window_id", "0"))
 except ValueError:
     window_id = 0
-configured = window_id > 0 and values.get("capture_window_owner") and values.get("capture_window_title")
-if not configured:
-    window_id = 0
 if not scene_path.is_file():
     raise SystemExit("OBS yayın sahnesi bulunamadı")
 
 scene = json.loads(scene_path.read_text(encoding="utf-8"))
 capture = next((source for source in scene.get("sources", []) if source.get("name") == "M3 Ekran ve Ses"), None)
 if capture is None:
-    raise SystemExit("OBS güvenli pencere kaynağı bulunamadı")
+    raise SystemExit("OBS ekran kaynağı bulunamadı")
 settings = capture.setdefault("settings", {})
+if mode == "display":
+    display_uuid = settings.get("display_uuid")
+    if not display_uuid:
+        scripts = scene.get("modules", {}).get("scripts-tool", [])
+        if isinstance(scripts, dict):
+            scripts = scripts.get("scripts", [])
+        for script in scripts:
+            candidate = script.get("settings", {}).get("display_uuid")
+            if isinstance(candidate, str) and candidate:
+                display_uuid = candidate
+                break
+    if not display_uuid:
+        raise SystemExit("OBS tam ekran hedefi bulunamadı")
+    settings.update({"type": 0, "display_uuid": display_uuid})
+    settings.pop("window", None)
+else:
+    configured = window_id > 0 and values.get("capture_window_owner") and values.get("capture_window_title")
+    settings.update({"type": 1, "window": window_id if configured else 0})
+    settings.pop("display_uuid", None)
 settings.update({
-    "type": 1,
-    "window": window_id,
     "show_cursor": True,
     "hide_obs": True,
     "show_empty_names": False,
-    "show_hidden_windows": True,
+    "show_hidden_windows": False,
 })
-settings.pop("display_uuid", None)
 
 fd, temporary = tempfile.mkstemp(prefix=scene_path.name + ".", suffix=".tmp", dir=scene_path.parent)
 try:
@@ -277,18 +325,17 @@ except Exception:
     except OSError:
         pass
     raise
-if not configured:
-    raise SystemExit("Önce DAAK Node'dan güvenli yayın penceresini seç.")
 PY
 }
 
-privacy_ready() {
-  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" <<'PY'
+capture_ready() {
+  /usr/bin/python3 - "$CAMERA_CONFIG" "$OBS_SCENE" "$(capture_mode_selection)" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-config_path, scene_path = map(Path, sys.argv[1:])
+config_path, scene_path = map(Path, sys.argv[1:3])
+mode = sys.argv[3]
 values = {}
 try:
     for line in config_path.read_text(encoding="utf-8").splitlines():
@@ -301,9 +348,11 @@ try:
     settings = capture.get("settings", {})
 except (OSError, ValueError, StopIteration, json.JSONDecodeError):
     raise SystemExit(1)
-if (window_id > 0 and values.get("capture_window_owner") and values.get("capture_window_title")
-        and settings.get("type") == 1 and int(settings.get("window", 0)) > 0
-        and not settings.get("display_uuid")):
+if mode == "display" and settings.get("type") == 0 and settings.get("display_uuid"):
+    raise SystemExit(0)
+if (mode == "window" and window_id > 0 and values.get("capture_window_owner")
+        and values.get("capture_window_title") and settings.get("type") == 1
+        and int(settings.get("window", 0)) > 0 and not settings.get("display_uuid")):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -516,26 +565,27 @@ PY
 }
 
 status() {
-  local selected sender receiver="unknown" quality effective layout vertical studio=false cameras=false privacy=false
+  local selected sender receiver="unknown" quality effective layout vertical capture_mode studio=false cameras=false privacy=false
   selected="$(route)"
   quality="$(quality_selection)"
   layout="$(layout_selection)"
   vertical="$(vertical_layout_selection)"
+  capture_mode="$(capture_mode_selection)"
   effective="$quality"
   [[ "$selected" == tailscale ]] && effective=1080p30
   sender="$(sender_state)"
   studio_ready && studio=true
   camera_ready && cameras=true
-  privacy_ready && privacy=true
+  capture_ready && privacy=true
   if [[ "$selected" != offline ]]; then
     receiver="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 "$(ssh_host "$selected")" \
       "$RECEIVER_COMMAND status" 2>/dev/null || print -r -- '{"state":"unknown"}')"
   else
     receiver='{"state":"offline"}'
   fi
-  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" "$layout" "$vertical" "$studio" "$cameras" "$privacy" "$CAMERA_CONFIG" <<'PY'
+  /usr/bin/python3 - "$selected" "$sender" "$receiver" "$quality" "$effective" "$layout" "$vertical" "$capture_mode" "$studio" "$cameras" "$privacy" "$CAMERA_CONFIG" <<'PY'
 import json, sys, time
-route, sender, receiver_raw, quality, effective, layout, vertical, studio, cameras, privacy, config_path = sys.argv[1:]
+route, sender, receiver_raw, quality, effective, layout, vertical, capture_mode, studio, cameras, privacy, config_path = sys.argv[1:]
 try:
     receiver = json.loads(receiver_raw).get("state", "unknown")
 except Exception:
@@ -564,6 +614,7 @@ print(json.dumps({
     "effectiveQuality": effective,
     "layout": layout,
     "verticalLayout": vertical,
+    "captureMode": capture_mode,
     "studioReady": studio == "true",
     "cameraReady": cameras == "true",
     "privacyReady": privacy == "true",
@@ -588,13 +639,18 @@ start_split() {
     apply_direct_quality "$quality"
   fi
   sync_camera_script
-  if ! apply_privacy_capture; then
-    write_state blocked "$selected" "Güvenli pencere seçilmeden yayın başlatılmadı."
+  if ! apply_capture_mode; then
+    write_state blocked "$selected" "Seçilen ekran yakalama modu hazırlanamadı."
     return 1
   fi
-  privacy_ready || {
-    write_state blocked "$selected" "Güvenli pencere seçilmeden yayın başlatılmadı."
-    print -u2 -- "Önce DAAK Node'dan güvenli yayın penceresini seç."
+  capture_ready || {
+    if [[ "$(capture_mode_selection)" == display ]]; then
+      write_state blocked "$selected" "Tüm ekran yakalama hedefi hazır değil."
+      print -u2 -- "OBS tam ekran hedefi hazır değil."
+    else
+      write_state blocked "$selected" "Güvenli pencere seçilmeden yayın başlatılmadı."
+      print -u2 -- "Önce DAAK Node'dan güvenli yayın penceresini seç."
+    fi
     return 1
   }
   /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
@@ -663,7 +719,7 @@ stop_all() {
 
 start_local() {
   sync_camera_script
-  apply_privacy_capture 2>/dev/null || true
+  apply_capture_mode 2>/dev/null || true
   /usr/bin/open -a /Applications/OBS.app
   write_state local offline "Intel erişilemiyor; yerel OBS açıldı."
   print -r -- '{"state":"local","route":"offline"}'
@@ -698,6 +754,13 @@ case "${1:-status}" in
       print -r -- "{\"verticalLayout\":\"$(vertical_layout_selection)\"}"
     fi
     ;;
+  capture)
+    if (( $# >= 2 )); then
+      set_capture_mode "$2"
+    else
+      print -r -- "{\"captureMode\":\"$(capture_mode_selection)\"}"
+    fi
+    ;;
   window)
     if (( $# == 2 )) && [[ "$2" == clear ]]; then
       clear_capture_window
@@ -706,5 +769,5 @@ case "${1:-status}" in
       set_capture_window "$2" "$3" "$4"
     fi
     ;;
-  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]|layout [screen|studio|phone|mac]|vertical [screen-phone|screen-mac|triple]|window ID OWNER TITLE|window clear}"; exit 64 ;;
+  *) print -u2 -- "usage: $0 {start|stop|local|status|quality [1080p60|1440p60]|layout [screen|studio|phone|mac]|vertical [screen-phone|screen-mac|triple]|capture [window|display]|window ID OWNER TITLE|window clear}"; exit 64 ;;
 esac
