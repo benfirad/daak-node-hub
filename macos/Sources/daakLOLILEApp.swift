@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreGraphics
 import Combine
 import Foundation
 @preconcurrency import CoreLocation
@@ -2525,8 +2526,12 @@ private struct BroadcastStatus: Decodable {
     let quality: String?
     let effectiveQuality: String?
     let layout: String?
+    let verticalLayout: String?
     let studioReady: Bool?
     let cameraReady: Bool?
+    let privacyReady: Bool?
+    let captureWindowID: Int?
+    let captureWindowOwner: String?
 }
 
 private enum BroadcastQuality: String, CaseIterable, Identifiable {
@@ -2568,6 +2573,30 @@ private enum BroadcastLayout: String, CaseIterable, Identifiable {
     }
 }
 
+private enum BroadcastVerticalLayout: String, CaseIterable, Identifiable {
+    case screenPhone = "screen-phone"
+    case screenMac = "screen-mac"
+    case triple
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .screenPhone: return "Ekran + telefon"
+        case .screenMac: return "Ekran + webcam"
+        case .triple: return "Üçlü"
+        }
+    }
+}
+
+private struct BroadcastWindowOption: Identifiable, Hashable {
+    let id: Int
+    let owner: String
+    let title: String
+
+    var label: String { "\(owner) · \(title)" }
+}
+
 @MainActor
 private final class BroadcastMonitor: ObservableObject {
     @Published private(set) var status: BroadcastStatus?
@@ -2575,6 +2604,9 @@ private final class BroadcastMonitor: ObservableObject {
     @Published private(set) var message = "Yayın yolu denetleniyor."
     @Published private(set) var selectedQuality: BroadcastQuality = .quadHD
     @Published private(set) var selectedLayout: BroadcastLayout = .studio
+    @Published private(set) var selectedVerticalLayout: BroadcastVerticalLayout = .screenPhone
+    @Published private(set) var selectedWindowID: Int?
+    @Published private(set) var availableWindows: [BroadcastWindowOption] = []
 
     private var script: String {
         Bundle.main.path(forResource: "daak-broadcast-control", ofType: "zsh")
@@ -2604,6 +2636,12 @@ private final class BroadcastMonitor: ObservableObject {
            let selected = BroadcastLayout(rawValue: layout) {
             selectedLayout = selected
         }
+        if let layout = decoded.verticalLayout,
+           let selected = BroadcastVerticalLayout(rawValue: layout) {
+            selectedVerticalLayout = selected
+        }
+        selectedWindowID = decoded.captureWindowID
+        refreshWindows()
         message = decoded.streaming ? "Canlı SRT akışı Intel Mac'e ulaşıyor." : routeMessage(decoded)
     }
 
@@ -2628,6 +2666,60 @@ private final class BroadcastMonitor: ObservableObject {
         )
     }
 
+    func setVerticalLayout(_ layout: BroadcastVerticalLayout) async {
+        guard status?.streaming != true else { return }
+        await perform(
+            "vertical",
+            arguments: [layout.rawValue],
+            progress: "\(layout.title) dikey düzeni kaydediliyor…"
+        )
+    }
+
+    func setCaptureWindow(_ window: BroadcastWindowOption) async {
+        guard status?.streaming != true else { return }
+        await perform(
+            "window",
+            arguments: [String(window.id), window.owner, window.title],
+            progress: "Güvenli yayın penceresi seçiliyor…"
+        )
+    }
+
+    private func refreshWindows() {
+        let ignoredOwners: Set<String> = [
+            "OBS", "Window Server", "WindowManager", "Dock", "Finder", "SystemUIServer", "loginwindow",
+            "Control Center", "Notification Center", "Centro de control", "Centro de notificaciones",
+            "Fondo de pantalla", "NotchNook", "ClockScrambler",
+            "daakLOLILE"
+        ]
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        let rawWindows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+        availableWindows = rawWindows.compactMap { entry in
+            guard let owner = entry[kCGWindowOwnerName as String] as? String,
+                  !ignoredOwners.contains(owner),
+                  let rawTitle = entry[kCGWindowName as String] as? String,
+                  let number = entry[kCGWindowNumber as String] as? NSNumber,
+                  let layer = entry[kCGWindowLayer as String] as? NSNumber,
+                  layer.intValue == 0,
+                  let sharing = entry[kCGWindowSharingState as String] as? NSNumber,
+                  sharing.intValue != 0,
+                  let bounds = entry[kCGWindowBounds as String] as? [String: Any],
+                  let width = bounds["Width"] as? NSNumber,
+                  let height = bounds["Height"] as? NSNumber,
+                  width.doubleValue >= 320,
+                  height.doubleValue >= 180 else { return nil }
+            let title = rawTitle
+                .replacingOccurrences(of: "\r", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return nil }
+            return BroadcastWindowOption(id: number.intValue, owner: owner, title: title)
+        }
+        .sorted {
+            $0.owner.localizedCaseInsensitiveCompare($1.owner) == .orderedAscending ||
+                ($0.owner == $1.owner && $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending)
+        }
+    }
+
     private func perform(_ action: String, arguments: [String] = [], progress: String) async {
         guard !isWorking else { return }
         isWorking = true
@@ -2643,6 +2735,7 @@ private final class BroadcastMonitor: ObservableObject {
     }
 
     private func routeMessage(_ value: BroadcastStatus) -> String {
+        if value.privacyReady != true { return "Önce yalnız yayında görünecek güvenli pencereyi seç." }
         if value.route == "offline" { return "Intel erişilemiyor; yerel OBS kullanılabilir." }
         if value.receiver == "idle" { return "Intel alıcısı henüz hazır değil." }
         if value.receiver == "receiving" { return "Intel alıyor ve VideoToolbox ile işliyor." }
@@ -2675,6 +2768,11 @@ private struct BroadcastView: View {
                     GridRow { Text("Intel alıcı").foregroundStyle(.secondary); Text(stateLabel(status.receiver)) }
                     GridRow { Text("Açık kaynak stüdyo").foregroundStyle(.secondary); Text(status.studioReady == true ? "Aitum hazır" : "Eklenti eksik") }
                     GridRow { Text("Kameralar").foregroundStyle(.secondary); Text(status.cameraReady == true ? "M3 + telefon hazır" : "Yapılandırılmadı") }
+                    GridRow {
+                        Text("Mahremiyet kilidi").foregroundStyle(.secondary)
+                        Text(status.privacyReady == true ? "Yalnız pencere · hazır" : "Pencere seçilmeli")
+                            .foregroundStyle(status.privacyReady == true ? Color.green : Color.orange)
+                    }
                 }
                 .font(.callout)
             }
@@ -2682,7 +2780,7 @@ private struct BroadcastView: View {
             HStack(spacing: 8) {
                 Button("Başlat") { Task { await monitor.start() } }
                     .buttonStyle(.borderedProminent)
-                    .disabled(monitor.isWorking || monitor.status?.streaming == true)
+                    .disabled(monitor.isWorking || monitor.status?.streaming == true || monitor.status?.privacyReady != true)
                 Button("Durdur") { Task { await monitor.stop() } }
                     .buttonStyle(.bordered)
                     .disabled(monitor.isWorking)
@@ -2698,6 +2796,28 @@ private struct BroadcastView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
+                Text("Yayında görünecek tek pencere")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Güvenli yayın penceresi",
+                    selection: Binding<Int?>(
+                        get: { monitor.selectedWindowID },
+                        set: { windowID in
+                            guard let windowID,
+                                  let window = monitor.availableWindows.first(where: { $0.id == windowID }) else { return }
+                            Task { await monitor.setCaptureWindow(window) }
+                        }
+                    )
+                ) {
+                    Text("Pencere seç").tag(Int?.none)
+                    ForEach(monitor.availableWindows) { window in
+                        Text(window.label).lineLimit(1).tag(Optional(window.id))
+                    }
+                }
+                .labelsHidden()
+                .disabled(monitor.isWorking || monitor.status?.streaming == true)
+
                 Text("Yayın düzeni")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -2709,6 +2829,24 @@ private struct BroadcastView: View {
                     )
                 ) {
                     ForEach(BroadcastLayout.allCases) { layout in
+                        Text(layout.title).tag(layout)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(monitor.isWorking || monitor.status?.streaming == true)
+
+                Text("Dikey 9:16 düzeni")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Dikey 9:16 düzeni",
+                    selection: Binding(
+                        get: { monitor.selectedVerticalLayout },
+                        set: { layout in Task { await monitor.setVerticalLayout(layout) } }
+                    )
+                ) {
+                    ForEach(BroadcastVerticalLayout.allCases) { layout in
                         Text(layout.title).tag(layout)
                     }
                 }
@@ -2739,13 +2877,13 @@ private struct BroadcastView: View {
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(monitor.status?.route == "direct" ? Color.green : Color.secondary)
 
-            Text("Aitum Vertical ve Multistream OBS içinde yerel çalışır. M3 ile telefon kameraları yatay ve 9:16 sahnelerde hazırdır. Kalite yayın kapalıyken değiştirilebilir; Thunderbolt ayrılırsa Tailscale 1080p30 rotasına geçilir. Platform anahtarları kaynak koda veya RM-OS'a yazılmaz.")
+            Text("OBS yalnız seçilen bağımsız pencereyi yakalar; menü barı, Dock ve masaüstü hiçbir zaman tam ekran kaynağı olarak kullanılmaz. Hedef pencere kapanırsa görüntü siyaha düşer. Dikey tuval ekran + telefon, ekran + webcam veya üçlü seçilebilir.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 500, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 620, alignment: .topLeading)
         .task { await monitor.refresh() }
     }
 
