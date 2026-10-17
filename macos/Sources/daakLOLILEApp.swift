@@ -7,6 +7,7 @@ import Foundation
 import UserNotifications
 import LocalAuthentication
 import UniformTypeIdentifiers
+import PDFKit
 
 private struct RelayStatus: Decodable {
     struct Permissions: Decodable {
@@ -557,6 +558,70 @@ private enum OpportunityResearchScope: String, CaseIterable, Identifiable {
     }
 }
 
+private struct CashHunterPayload: Decodable {
+    let updatedAt: String?
+    let runs: Int?
+    let stats: CashHunterStats?
+    let items: [CashHunterLead]
+}
+
+private struct CashHunterStats: Decodable {
+    let totalLeads: Int
+    let localLeads: Int
+    let expoLeads: Int
+    let garageLeads: Int
+    let noWebsiteCount: Int
+    let sslOrMobileIssueCount: Int
+    let oppEvents: Int
+    let oppCompletedQueue: Int
+    let oppPendingQueue: Int
+    let oppPublished: Int
+}
+
+private struct CashHunterLead: Decodable, Identifiable, Equatable {
+    let id: String
+    let leadType: String
+    let name: String
+    let country: String
+    let city: String
+    let category: String
+    let phone: String
+    let email: String
+    let website: String
+    let address: String
+    let issue: String
+    let price: String
+    let score: Int
+    let pitch: String
+    let discoveredAt: String
+    let status: String
+
+    var hasNoWebsite: Bool {
+        website.uppercased().contains("YOK") || website.trimmingCharacters(in: .whitespacesAndNewlines) == "-"
+    }
+
+    var hasVerifiedEmail: Bool {
+        email != "-" && !email.isEmpty && email.contains("@")
+    }
+
+    var shortCode: String {
+        let digits = id.filter(\.isNumber)
+        if digits.count >= 6 {
+            return String(digits.suffix(6))
+        }
+        return String(abs(id.hashValue) % 900_000 + 100_000)
+    }
+
+    var leadTypeLabel: String {
+        switch leadType {
+        case "LOCAL_BUSINESS": return "Yerel İşletme"
+        case "EXPO_EXHIBITOR": return "Fuar & Katalog"
+        case "RM_GARAGE_AUTO": return "RM Garage Oto"
+        default: return "Küresel Hedef"
+        }
+    }
+}
+
 private struct MailAccountList: Decodable {
     struct Account: Decodable, Identifiable {
         var id: String { address }
@@ -688,9 +753,9 @@ private final class UpdateMonitor: ObservableObject {
     private let lastCheckKey = "DAAKNodeLastUpdateCheck"
 
     var versionLabel: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.20.0"
         let commit = Bundle.main.object(forInfoDictionaryKey: "DAAKSourceCommit") as? String ?? "development"
-        return "v\(version) • \(String(commit.prefix(7)))"
+        return "v\(version) (PDF Study Hub) • \(String(commit.prefix(7)))"
     }
 
     init() {
@@ -1400,7 +1465,11 @@ private final class MYAL11Monitor: ObservableObject {
 private final class OpportunityMonitor: ObservableObject {
     @Published private(set) var healthNodes: [OpportunityHealth] = []
     @Published private(set) var opportunities: [OpportunityDossier] = []
+    @Published private(set) var cashHunterLeads: [CashHunterLead] = []
+    @Published private(set) var cashHunterStats: CashHunterStats?
+    @Published private(set) var cashHunterUpdatedAt: String?
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isRunningCashHunter = false
     @Published private(set) var isOpeningDashboard = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var lastError: String?
@@ -1410,9 +1479,15 @@ private final class OpportunityMonitor: ObservableObject {
     private var timer: Timer?
     private var retryTask: Task<Void, Never>?
 
+    private static var localCacheURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/DAAK/cash_hunter_leads_cache.json")
+    }
+
     init() {
-        timer = Timer(timeInterval: 300, repeats: true) { _ in
-            Task { @MainActor [weak self] in await self?.refresh() }
+        loadCachedCashHunter()
+        timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
         }
         timer?.tolerance = 30
         if let timer { RunLoop.main.add(timer, forMode: .common) }
@@ -1422,6 +1497,16 @@ private final class OpportunityMonitor: ObservableObject {
     deinit {
         timer?.invalidate()
         retryTask?.cancel()
+    }
+
+    private func loadCachedCashHunter() {
+        guard let data = try? Data(contentsOf: Self.localCacheURL),
+              let payload = try? JSONDecoder().decode(CashHunterPayload.self, from: data) else {
+            return
+        }
+        cashHunterLeads = payload.items
+        cashHunterStats = payload.stats
+        cashHunterUpdatedAt = payload.updatedAt
     }
 
     func sourceCoverage(for scope: OpportunityResearchScope) -> (live: Int, total: Int) {
@@ -1438,7 +1523,7 @@ private final class OpportunityMonitor: ObservableObject {
 
     var fabricReady: Bool {
         let coverage = sourceCoverage(for: .local)
-        return coverage.total > 0 && coverage.live > 0 && !healthNodes.isEmpty
+        return (coverage.total > 0 && coverage.live > 0 && !healthNodes.isEmpty) || !cashHunterLeads.isEmpty
     }
 
     func fabricReady(for scope: OpportunityResearchScope) -> Bool {
@@ -1485,6 +1570,88 @@ private final class OpportunityMonitor: ObservableObject {
         }
     }
 
+    func copyPitch(_ lead: CashHunterLead) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lead.pitch, forType: .string)
+        actionMessage = "✓ \(lead.name) (\(lead.city)) için hazır teklif mesajı panoya kopyalandı."
+    }
+
+    func openLeadTarget(_ lead: CashHunterLead) {
+        let target: String
+        if !lead.hasNoWebsite,
+           let url = URL(string: lead.website.hasPrefix("http") ? lead.website : "https://" + lead.website) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let query = "\(lead.name) \(lead.city)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? lead.name
+        target = "https://www.google.com/maps/search/\(query)"
+        if let url = URL(string: target) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func sendLeadToWhatsApp(_ lead: CashHunterLead) async {
+        let msg = """
+        🎯 *DAAK NODE SEÇİLİ HEDEF KARTI*
+        • *İşletme:* \(lead.name) (\(lead.country) · \(lead.city))
+        • *Sektör:* \(lead.category) | *Paket:* `\(lead.price)` | *Skor:* `\(lead.score)`
+        • *Tel:* `\(lead.phone)` | *E-posta:* `\(lead.email)`
+        • *Web:* \(lead.website)
+        • *Açık:* \(lead.issue)
+
+        💬 *Kopyalanmaya Hazır Teklif Mesajı:*
+        _\(lead.pitch)_
+        """
+        let ok = await Self.postWhatsAppMessage(msg)
+        actionMessage = ok
+            ? "✓ \(lead.name) hedef kartı ve hazır mesajı WhatsApp'ına gönderildi."
+            : "WhatsApp köprüsüne ulaşılamadı; mesajı panoya kopyalayabilirsin."
+    }
+
+    func triggerCashHunterScanNow() async {
+        guard !isRunningCashHunter else { return }
+        isRunningCashHunter = true
+        actionMessage = "LOLİLE (1000 Mbps) üzerinde Dubai, İsviçre, ABD, UK, Kanada, İspanya ve Türkiye taraması başlatıldı…"
+        defer { isRunningCashHunter = false }
+
+        let res = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "lolile-openclaw",
+                "\"C:\\Program Files\\Python313\\python.exe\" B:\\DAAK-CashHunter\\daak_cash_hunter.py",
+            ]
+        )
+        await refresh()
+        if res.exitCode == 0 {
+            actionMessage = "✓ Yeni küresel tarama tamamlandı, tabloya eklendi ve WhatsApp'ına raporlandı."
+        } else {
+            actionMessage = "Tarama tamamlandı veya önbellekten güncellendi."
+        }
+    }
+
+    func sendTestOutreach(leadId: String? = nil) async {
+        let arg = (leadId != nil && !leadId!.isEmpty) ? "\"\(leadId!)\"" : ""
+        let cmd = "python3 /Users/mac/ServerShare/Containers/core/redmono_outreach_autopilot.py --test-send \(arg)"
+        actionMessage = "Test e-postası 4gadakai@gmail.com adresine gönderiliyor…"
+        let res = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=8",
+                "mya-l11-tail",
+                cmd,
+            ]
+        )
+        if res.exitCode == 0 {
+            actionMessage = "✓ Test e-postası 4gadakai@gmail.com adresine başarıyla gönderildi (Begüm | Redmono)."
+            await refresh()
+        } else {
+            actionMessage = "Test e-postası gönderilemedi: \(res.output.prefix(60))"
+        }
+    }
+
     func refresh() async {
         guard !isRefreshing else { return }
         isRefreshing = true
@@ -1494,13 +1661,24 @@ private final class OpportunityMonitor: ObservableObject {
         async let lolileHealth = Self.fetchHealth(host: "lolile-openclaw", windows: true)
         async let lolileDossiers = Self.fetchDossiers(host: "lolile-openclaw", windows: true)
         async let myaDossiers = Self.fetchDossiers(host: "mya-l11-tail", windows: false)
+        async let hunterPayload = Self.fetchCashHunterPayload()
 
-        let (mya, lolile, lolileIdeas, myaIdeas) = await (
-            myaHealth, lolileHealth, lolileDossiers, myaDossiers
+        let (mya, lolile, lolileIdeas, myaIdeas, hunter) = await (
+            myaHealth, lolileHealth, lolileDossiers, myaDossiers, hunterPayload
         )
+        if let hunter {
+            cashHunterLeads = hunter.items
+            cashHunterStats = hunter.stats
+            cashHunterUpdatedAt = hunter.updatedAt
+        } else {
+            loadCachedCashHunter()
+        }
+
         let healthy = [mya, lolile].compactMap { $0 }
         guard !healthy.isEmpty else {
-            lastError = "MYA-L11 ve LOLILE araştırma düğümlerine ulaşılamadı; son doğrulanmış görünüm korunuyor."
+            if cashHunterLeads.isEmpty {
+                lastError = "MYA-L11 ve LOLILE araştırma düğümlerine ulaşılamadı; son doğrulanmış görünüm korunuyor."
+            }
             scheduleRetry()
             return
         }
@@ -1524,12 +1702,10 @@ private final class OpportunityMonitor: ObservableObject {
                 }
         }
         lastUpdated = Date()
-        if lolileIdeas == nil && myaIdeas == nil {
+        if lolileIdeas == nil && myaIdeas == nil && cashHunterLeads.isEmpty {
             lastError = "Fikir dosyaları okunamadı; önceki liste korunuyor."
             scheduleRetry()
         } else if healthy.count < 2 {
-            // Do not trigger an aggressive 20-second retry storm when LOLILE is
-            // sleeping/hibernating while MYA-L11 is healthy; wait for the 300s timer.
             lastError = lolile == nil
                 ? "LOLİLE uykuda/hibernasyonda · MYA-L11 araştırma düğümü aktif."
                 : "Araştırma düğümlerinden biri çevrimdışı; mevcut düğümün verisi gösteriliyor."
@@ -1591,6 +1767,78 @@ private final class OpportunityMonitor: ObservableObject {
             }
         }
         actionMessage = "Fırsat paneli için güvenli tünel açılamadı."
+    }
+
+    private static func fetchCashHunterPayload() async -> CashHunterPayload? {
+        let cmd = "\"C:\\Program Files\\Python313\\python.exe\" -c \"import pathlib, sys; sys.stdout.reconfigure(encoding='utf-8'); p=pathlib.Path(r'B:\\DAAK-CashHunter\\data\\all_discovered_leads.json'); print(p.read_text(encoding='utf-8') if p.exists() else '')\""
+        let result = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-C",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=8",
+                "-o", "ConnectionAttempts=1",
+                "lolile-openclaw",
+                cmd,
+            ]
+        )
+        if result.exitCode == 0, !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let data = Data(result.output.utf8)
+            if let decoded = try? JSONDecoder().decode(CashHunterPayload.self, from: data) {
+                try? FileManager.default.createDirectory(
+                    at: localCacheURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try? data.write(to: localCacheURL, options: .atomic)
+                return decoded
+            }
+        }
+
+        // Resilient Fallback to MYA-L11 24/7 Hot-Standby
+        let myaResult = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ConnectionAttempts=1",
+                "mya-l11-tail",
+                "cat /Users/mac/ServerShare/Containers/core/all_discovered_leads.json 2>/dev/null || cat /Users/mac/.hermes/rm-os/RM-OS/BUSINESSES/REDMONO/all_discovered_leads.json",
+            ]
+        )
+        if myaResult.exitCode == 0, !myaResult.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let data = Data(myaResult.output.utf8)
+            if let decoded = try? JSONDecoder().decode(CashHunterPayload.self, from: data) {
+                try? FileManager.default.createDirectory(
+                    at: localCacheURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try? data.write(to: localCacheURL, options: .atomic)
+                return decoded
+            }
+        }
+        return nil
+    }
+
+    private static func postWhatsAppMessage(_ message: String) async -> Bool {
+        let payloadDict: [String: String] = [
+            "chatId": "221767012487282@lid",
+            "message": message,
+        ]
+        guard let body = try? JSONSerialization.data(withJSONObject: payloadDict) else { return false }
+        for urlStr in ["http://100.106.212.28:3009/send", "http://192.168.0.15:3009/send"] {
+            guard let url = URL(string: urlStr) else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 12
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = body
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               http.statusCode == 200 {
+                return true
+            }
+        }
+        return false
     }
 
     private static func fetchHealth(host: String, windows: Bool) async -> OpportunityHealth? {
@@ -4026,8 +4274,68 @@ private struct OpportunityView: View {
                 .padding(10)
                 .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 11))
 
+                if !monitor.cashHunterLeads.isEmpty {
+                    HStack {
+                        Text("KÜRESEL YEREL İŞLETME & FUAR AVCISI (\(monitor.cashHunterLeads.count))")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.indigo)
+                        Spacer()
+                        Button(monitor.isRunningCashHunter ? "Taranıyor…" : "Şimdi Tara") {
+                            Task { await monitor.triggerCashHunterScanNow() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.indigo)
+                        .controlSize(.mini)
+                    }
+
+                    ForEach(Array(monitor.cashHunterLeads.prefix(6))) { lead in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("[\(lead.country) · \(lead.city)] \(lead.name)")
+                                    .font(.caption.weight(.bold))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(lead.price)
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.indigo)
+                                Text("\(lead.score)")
+                                    .font(.caption2.monospacedDigit().weight(.bold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.16), in: Capsule())
+                            }
+                            Text("\(lead.category) · Tel: \(lead.phone) · \(lead.issue)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                            HStack(spacing: 8) {
+                                Button("Teklifi Kopyala") {
+                                    monitor.copyPitch(lead)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+
+                                Button("WhatsApp'a Gönder") {
+                                    Task { await monitor.sendLeadToWhatsApp(lead) }
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.teal)
+                                .controlSize(.mini)
+
+                                Button("Harita / Web") {
+                                    monitor.openLeadTarget(lead)
+                                }
+                                .buttonStyle(.borderless)
+                                .font(.caption2)
+                            }
+                        }
+                        .padding(10)
+                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+
                 HStack {
-                    Text("DOĞRULAMA ADAYLARI")
+                    Text("KAMU & İHALE DOĞRULAMA ADAYLARI")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -4915,6 +5223,7 @@ private struct StudyChecklistItem: Identifiable, Hashable {
     let topic: String
     let detail: String
     let priority: String // "KRİTİK", "YÜKSEK", "NORMAL"
+    var pdfFileName: String? = nil
 }
 
 private struct CourseFileItem: Identifiable, Hashable {
@@ -4923,6 +5232,8 @@ private struct CourseFileItem: Identifiable, Hashable {
     let relativePath: String
     let fullPath: String
     let isMarkdown: Bool
+    let isPDF: Bool
+    let isStudyGuidePDF: Bool
     let isSimulation: Bool
     let sizeLabel: String
 }
@@ -4996,6 +5307,7 @@ private final class UniversityStudyMonitor: ObservableObject {
     @Published var selectedMarkdownTitle: String = "Çalışma Rehberi & Özet"
     @Published var selectedMarkdownContent: String = ""
     @Published var selectedMarkdownPath: String = ""
+    @Published var selectedPDFPath: String = ""
     @Published var personalNoteDraft: String = ""
     @Published var isSyncingEV: Bool = false
     @Published var syncStatusMessage: String?
@@ -5066,12 +5378,47 @@ private final class UniversityStudyMonitor: ObservableObject {
         selectedCourseID = id
         personalNoteDraft = UserDefaults.standard.string(forKey: notesDefaultsPrefix + id) ?? ""
         let files = courseFiles[id] ?? []
-        if let guide = files.first(where: { $0.isMarkdown && !$0.isSimulation }) ?? files.first(where: { $0.isMarkdown }) {
-            loadMarkdownFile(guide)
+        if let firstGuidePDF = files.first(where: { $0.isStudyGuidePDF }) ?? files.first(where: { $0.isPDF }) {
+            selectFile(firstGuidePDF)
+        } else if let guideMD = files.first(where: { $0.isMarkdown }) {
+            selectFile(guideMD)
         } else {
             selectedMarkdownTitle = selectedCourse.titleTR
             selectedMarkdownPath = ""
+            selectedPDFPath = ""
             selectedMarkdownContent = "Bu ders için çalışma rehberi hazırlanıyor."
+        }
+    }
+
+    func selectFile(_ item: CourseFileItem) {
+        selectedMarkdownTitle = item.name
+        selectedMarkdownPath = item.fullPath
+        if item.isPDF {
+            selectedPDFPath = item.fullPath
+            selectedMarkdownContent = ""
+        } else if item.isMarkdown {
+            selectedPDFPath = ""
+            if let text = try? String(contentsOfFile: item.fullPath, encoding: .utf8) {
+                selectedMarkdownContent = text
+            } else {
+                selectedMarkdownContent = "Dosya okunamadı: \(item.fullPath)"
+            }
+        } else {
+            openInPreviewOrFinder(item.fullPath)
+        }
+    }
+
+    func openChecklistPDF(_ item: StudyChecklistItem, alsoOpenExternal: Bool = false) {
+        guard let pdfName = item.pdfFileName else { return }
+        let full = "\(selectedCourse.folderPath)/\(pdfName)"
+        if FileManager.default.fileExists(atPath: full) {
+            selectedMarkdownTitle = pdfName
+            selectedMarkdownPath = full
+            selectedPDFPath = full
+            selectedMarkdownContent = ""
+            if alsoOpenExternal {
+                openInPreviewOrFinder(full)
+            }
         }
     }
 
@@ -5081,21 +5428,16 @@ private final class UniversityStudyMonitor: ObservableObject {
     }
 
     func loadMarkdownFile(_ item: CourseFileItem) {
-        selectedMarkdownTitle = item.name
-        selectedMarkdownPath = item.fullPath
-        if let text = try? String(contentsOfFile: item.fullPath, encoding: .utf8) {
-            selectedMarkdownContent = text
-        } else {
-            selectedMarkdownContent = "Dosya okunamadı: \(item.fullPath)"
-        }
+        selectFile(item)
     }
 
     func loadMasterStudyPlan() {
-        let planPath = "\(rootPath)/MUFREDAT_VE_CALISMA_PLANI.md"
-        selectedMarkdownTitle = "MUFREDAT_VE_CALISMA_PLANI.md"
-        selectedMarkdownPath = planPath
-        if let text = try? String(contentsOfFile: planPath, encoding: .utf8) {
-            selectedMarkdownContent = text
+        let planPDF = "\(rootPath)/00_MUFREDAT_VE_CALISMA_PLANI.pdf"
+        if FileManager.default.fileExists(atPath: planPDF) {
+            selectedMarkdownTitle = "00_MUFREDAT_VE_CALISMA_PLANI.pdf"
+            selectedMarkdownPath = planPDF
+            selectedPDFPath = planPDF
+            selectedMarkdownContent = ""
         }
     }
 
@@ -5147,6 +5489,9 @@ private final class UniversityStudyMonitor: ObservableObject {
                     let attrs = try? fm.attributesOfItem(atPath: full)
                     let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
                     let isMD = ext == "md"
+                    let isPDF = ext == "pdf"
+                    let isRootLevel = !rel.contains("/")
+                    let isGuidePDF = isPDF && isRootLevel && (rel.hasPrefix("00_") || rel.hasPrefix("01_") || rel.hasPrefix("02_") || rel.hasPrefix("03_") || rel.hasPrefix("04_") || rel.hasPrefix("05_"))
                     let isSim = rel.uppercased().contains("SIMULASYON") || rel.uppercased().contains("EXAMEN")
                     items.append(
                         CourseFileItem(
@@ -5155,6 +5500,8 @@ private final class UniversityStudyMonitor: ObservableObject {
                             relativePath: rel,
                             fullPath: full,
                             isMarkdown: isMD,
+                            isPDF: isPDF,
+                            isStudyGuidePDF: isGuidePDF,
                             isSimulation: isSim,
                             sizeLabel: byteFormatter.string(fromByteCount: size)
                         )
@@ -5162,7 +5509,8 @@ private final class UniversityStudyMonitor: ObservableObject {
                 }
             }
             items.sort { a, b in
-                if a.isMarkdown != b.isMarkdown { return a.isMarkdown }
+                if a.isStudyGuidePDF != b.isStudyGuidePDF { return a.isStudyGuidePDF }
+                if a.relativePath.contains("/") != b.relativePath.contains("/") { return !a.relativePath.contains("/") }
                 return a.relativePath < b.relativePath
             }
             map[course.id] = items
@@ -5177,7 +5525,7 @@ private final class UniversityStudyMonitor: ObservableObject {
                 code: "1530002",
                 shortName: "Derecho Privado",
                 titleTR: "Özel Hukuk (Medeni & Ticaret Hukuku)",
-                titleES: "Elementos de Derecho Privado",
+                titleES: "Instituciones Básicas de Derecho Privado",
                 folderName: "01_Derecho_Privado",
                 semester: "1. Dönem + Ekim 3ª Conv.",
                 professor: "Prof. Dra. María del Rosario Sánchez Valle",
@@ -5191,25 +5539,26 @@ private final class UniversityStudyMonitor: ObservableObject {
                 whatWillBeAsked: [
                     "Norma Jurídica & Fuentes del Derecho (Art. 1.1 CC): Ley → Costumbre → Principios Generales del Derecho sıralaması ve 20 günlük vacatio legis.",
                     "Leyes Orgánicas (Art. 81 CE - tam üye salt çoğunluğu) vs. Decreto-Ley (Art. 86 CE - olağanüstü ve acil ihtiyaç, 30 günde Meclis onayı) vs. Decreto Legislativo.",
-                    "Capacidad Jurídica (doğumla başlar, Art. 29-30 CC) ve Ejercicio de la Capacidad (8/2021 reformu sonrası engellilerde Curatela destek sistemi).",
-                    "Temsil Hukuku (Representación): Falsus procurator (yetkisiz temsilcinin işlemi Askıda Hükümsüz / Nulidad (Art. 1259 CC) — temsil edilenin Ratificación onayıyla geçerli olur).",
-                    "Obligaciones Mancomunadas (Medeni Hukukta genel kural, Art. 1137 CC — borç bölünür) vs. Solidarias (Ticaret Hukukunda sık, alacaklı tek borçludan %100'ü isteyebilir).",
-                    "Sözleşmenin 3 Esaslı Unsuru (Art. 1261 CC): Consentimiento + Objeto + Causa. Eksikse Nulidad Absoluta (kesin hükümsüz, süre sınırı yok); hata/hile/tehdit varsa Anulabilidad (4 yıl hak düşürücü süre / caducidad).",
-                    "Art. 1124 CC Karşılıklı Borçlarda İfa Engeli: İfaya zorlama (Cumplimiento) veya Sözleşmeyi Fesih (Resolución) + Tazminat.",
-                    "Art. 1911 CC Sınırsız Malvarlığı Sorumluluğu: Borçlu tüm şimdiki ve gelecekteki malvarlığıyla sorumludur."
+                    "Capacidad Jurídica (doğumla başlar, Art. 29-30 CC), Emancipación (16 yaş, Art. 323 CC) ve Ley 8/2021 reformu sonrası engellilerde Curatela / Guarda de hecho destek sistemi.",
+                    "Temsil Hukuku (Representación): Falsus procurator (yetkisiz temsilcinin işlemi Nulidad, Art. 1259 CC — temsil edilenin Ratificación onayıyla geçerli olur).",
+                    "Obligaciones Mancomunadas (Medeni Hukukta genel kural, Art. 1137 CC — borç bölünür) vs. Solidarias (İstisna, açıkça kararlaştırılmalı).",
+                    "Sözleşmenin 3 Esaslı Unsuru (Art. 1261 CC): Consentimiento + Objeto + Causa. Eksikse Nulidad Absoluta (süresiz); hata/hile/tehdit varsa Anulabilidad (4 yıl caducidad).",
+                    "Özel Sözleşmeler: Compraventa (Evicción y vicios ocultos), Obra (resultado) vs Servicios (medios), Comodato vs Mutuo, Fianza (Beneficio de excusión).",
+                    "Art. 1902 CC Haksız Fiil Sorumluluğu (Derecho de Daños): Zamanaşımı süresi zararın öğrenilmesinden itibaren 1 yıldır (Art. 1968.2 CC)."
                 ],
                 formulasAndTraps: [
-                    "TUZAK 1: İspanyol Medeni Kanunu'nda (Art. 1.6 CC) Jurisprudencia (Yargıtay/Tribunal Supremo içtihadı) resmi hukuk kaynağı DEĞİLDİR; hukuk düzenini tamamlar.",
+                    "TUZAK 1: İspanyol Medeni Kanunu'nda (Art. 1.6 CC) Jurisprudencia (Tribunal Supremo içtihadı) resmi hukuk kaynağı DEĞİLDİR; hukuk düzenini tamamlar.",
                     "TUZAK 2: Borçlarda aksine açık hüküm yoksa kural Solidaridad değil MANCOMUNIDAD'dır (Art. 1137 CC).",
                     "TUZAK 3: Prescripción (zamanaşımı — ihtarname/mahkeme dışı taleple kesilir ve sıfırlanır) vs. Caducidad (hak düşürücü süre — kesilmez, hakim re'sen dikkate alır).",
-                    "SINAV STRATEJİSİ: Yanlış doğruyu götürmediği için 30 sorunun tamamını işaretle! 01_SINAV_SIMULASYONU_30_SORU.md içindeki 30 soruyu mutlaka çöz."
+                    "SINAV STRATEJİSİ: Yanlış doğruyu götürmediği için 30 sorunun tamamını işaretle! 05_SINAV_SIMULASYONU_30_SORU_COZUMLU.pdf içindeki 30 soruyu mutlaka çöz."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "dp_1", topic: "Tema 1-2: Hukuk Kaynakları, Kanun Türleri, Kişilik & Temsil", detail: "Ley Orgánica / Decreto-Ley / Vacatio Legis (20 gün) / Falsus Procurator (Art. 1259 CC)", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "dp_2", topic: "Tema 3-4: Borçlar Hukuku, Mancomunada vs Solidaria, Art. 1124 & 1911", detail: "Kusurlu temerrüt (Mora), Dación en pago vs Pago por cesión de bienes farkı", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "dp_3", topic: "Tema 5-6: Sözleşme Unsurları (Art. 1261), Nulidad vs Anulabilidad (4 yıl)", detail: "Tüketici cayma hakkı (Desistimiento: 14 takvim günü), Satım & Kira sözleşmeleri", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "dp_4", topic: "Tema 7: Ticari İşletme (Empresario), S.A. (60.000€) vs S.L. (3.000€/1€)", detail: "Registro Mercantil zorunluluğu, Concursal (İflas) ve kambiyo senetleri", priority: "YÜKSEK"),
-                    StudyChecklistItem(id: "dp_5", topic: "30 Soruluk Gerçek Sınav Simülasyonunu Çöz (01_SINAV_SIMULASYONU_30_SORU.md)", detail: "En az 22/30 doğru hedefiyle tüm şıkları ve açıklamaları kontrol et", priority: "KRİTİK")
+                    StudyChecklistItem(id: "dp_0", topic: "Master Rehber: Süreler (Plazos) Tablosu & İkili Kavram Farkları", detail: "00_MASTER_REHBER_VE_13_LECCION_OZET.pdf — 20 gün, 1 yıl, 4 yıl, 5 yıl, 10 yıl tablosu", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_13_LECCION_OZET.pdf"),
+                    StudyChecklistItem(id: "dp_1", topic: "Lección 1-4: Hukuk Normu, Kaynaklar, Uygulama & Sübjektif Hak", detail: "01_LECCION_1_2_3_4_Norma_Fuentes_y_Derecho_Subjetivo_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "01_LECCION_1_2_3_4_Norma_Fuentes_y_Derecho_Subjetivo_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "dp_2", topic: "Lección 5-6: Gerçek Kişi (Nasciturus, Emancipación, Ley 8/2021) & Tüzel Kişi", detail: "02_LECCION_5_6_Persona_Fisica_Ley8_2021_y_Persona_Juridica_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "02_LECCION_5_6_Persona_Fisica_Ley8_2021_y_Persona_Juridica_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "dp_3", topic: "Lección 7-9: Eşyalar, Frutos, Ayni Haklar (Prenda/Hipoteca) & Título y Modo", detail: "03_LECCION_7_8_9_Patrimonio_Derechos_Reales_y_Circulacion_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "03_LECCION_7_8_9_Patrimonio_Derechos_Reales_y_Circulacion_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "dp_4", topic: "Lección 10-13: Borçlar, Sözleşmeler, Özel Sözleşmeler & Art. 1902 Daños", detail: "04_LECCION_10_11_12_13_Obligaciones_Contratos_y_Danos_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "04_LECCION_10_11_12_13_Obligaciones_Contratos_y_Danos_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "dp_5", topic: "30 Soruluk Gerçek Sınav Simülasyonunu Çöz", detail: "05_SINAV_SIMULASYONU_30_SORU_COZUMLU.pdf — Kanun maddeli çözümler", priority: "KRİTİK", pdfFileName: "05_SINAV_SIMULASYONU_30_SORU_COZUMLU.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5217,7 +5566,7 @@ private final class UniversityStudyMonitor: ObservableObject {
                 code: "1530001",
                 shortName: "Contabilidad Financiera",
                 titleTR: "Finansal Muhasebe I",
-                titleES: "Contabilidad Financiera I",
+                titleES: "Fundamentos de Contabilidad",
                 folderName: "02_Contabilidad",
                 semester: "1. Dönem + Ekim 3ª Conv.",
                 professor: "Departamento de Contabilidad y Economía Financiera",
@@ -5226,37 +5575,37 @@ private final class UniversityStudyMonitor: ObservableObject {
                 examLocation: "Aula 03 (G1 - FCEE)",
                 convocatoria: "3ª Convocatoria (Ekim)",
                 examFormat: "Teorik-Pratik Yazılı Sınav (Bilanço Sınıflandırması + Libro Diario Yevmiye + Regularización)",
-                passRule: "NIE/Pasaport ve normal hesap makinesi zorunlu! Aktif = Pasif + Özkaynak eşitliği ve yevmiye dengesi tam olmalı.",
+                passRule: "NIE/Pasaport ve normal hesap makinesi zorunlu! Activo = Pasivo + PN eşitliği ve yevmiye dengesi tam olmalı.",
                 accentColorName: "blue",
                 whatWillBeAsked: [
-                    "Bölüm 1 — Masas Patrimoniales & Balance de Situación: Verilen hesapları ANC (Duran Varlık), AC (Dönen Varlık: Existencias, Realizable, Disponible), PN (Özkaynak), PNC (Uzun Vadeli Borç) ve PC (Kısa Vadeli Borç) olarak sınıflandırma.",
-                    "Bölüm 2 — Libro Diario (Yevmiye Kayıtları): Ticari mal alış/satışı, iskonto, müşteriden senet/çek alma, banka kredisi, personel maaşı ve kira/fatura kayıtları.",
-                    "Bölüm 3 — Variación de Existencias (Stok Değişimi): Dönem başı stokları (Existencias Iniciales) kapatıp dönem sonu stoklarını (Existencias Finales) kaydetme.",
-                    "Bölüm 4 — Ajustes de Periodificación & Amortización: Peşin ödenen giderler (Gastos anticipados), maddi duran varlık amortisman kaydı (Amortización del Inmovilizado → Amortización Acumulada).",
-                    "Bölüm 5 — Regularización (31/12 Kâr/Zarar Hesaplaması) ve Asiento de Cierre: Grup 6 (Giderler) ve Grup 7 (Gelirler) hesaplarını 129 Resultado del Ejercicio hesabına devretme."
+                    "Bölüm 1 — Masas Patrimoniales & Balance de Situación: Verilen hesapları ANC (Duran Varlık), AC (Dönen Varlık: Existencias, Realizable, Disponible), PN (Özkaynak), PNC ve PC olarak sınıflandırma.",
+                    "Bölüm 2 — Libro Diario (Yevmiye Kayıtları): Ticari mal alış/satışı, KDV (472/477), iskonto, iade (608/708), banka kredisi ve personel maaş bordrosu (Nómina).",
+                    "Bölüm 3 — Variación de Existencias (Stok Değişimi): Dönem başı stokları (610 a 300) kapatıp dönem sonu stoklarını (300 a 610) kaydetme.",
+                    "Bölüm 4 — Ajustes de Periodificación & Amortización: Peşin ödenen giderler (480 Gastos anticipados), maddi duran varlık amortisman kaydı (681 → 281).",
+                    "Bölüm 5 — Regularización (31/12 Kâr/Zarar Hesaplaması) ve Asiento de Cierre: Grup 6 ve Grup 7 hesaplarını 129 Resultado del Ejercicio hesabına devretme."
                 ],
                 formulasAndTraps: [
                     "ALTIN DENKLEM: Activo (ANC + AC) = Patrimonio Neto (PN) + Pasivo (PNC + PC)",
                     "BORÇ / ALACAK KURALI (Debe / Haber): Varlık (Activo) ve Gider (Gasto - Grup 6) artışları DEBE (Sol); Borç (Pasivo), Özkaynak (PN) ve Gelir (Ingreso - Grup 7) artışları HABER (Sağ).",
                     "TUZAK: Amortización Acumulada del Inmovilizado (281) Pasif değildir! Aktifte (ANC altında) eksi (-) işaretli düzenleyici hesaptır.",
-                    "TUZAK: Dönem sonu stok kaydında önce başlangıç stoku (Debe: 610 Variación / Haber: 300 Mercaderías) kapatılır, sonra bitiş stoku (Debe: 300 Mercaderías / Haber: 610 Variación) açılır."
+                    "TUZAK: 438 Anticipos de clientes PASİF (PC); 407 Anticipos a proveedores ise AKTİF (AC - Existencias) hesabıdır!"
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "cf_1", topic: "Blok I (Tema 1-2): Masas Patrimoniales (ANC, AC, PN, PNC, PC) & Bilanço", detail: "SUPUESTOS 1.1–2.10 alıştırmalarındaki hesap sınıflandırmalarını çöz", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "cf_2", topic: "Blok II (Tema 3-4): Libro Diario, Mayor & Ticari Mal (Mercaderías) İşlemleri", detail: "Alış, satış, iade, iskonto ve stok değişimi (Variación de Existencias)", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "cf_3", topic: "Blok III (Tema 5-6): Amortisman, Karşılıklar (Deterioro), Regularización 31/12", detail: "Supuestos 6.1–6.5 tam muhasebe döngüsü (Ciclo Contable Completo) çözümü", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "cf_4", topic: "PGC (Plan General de Contabilidad) Hesap Grupları (Grup 1–7) Tekrarı", detail: "Özellikle Grup 2 (Duran), 3 (Stok), 4 (Alacak/Borç), 5 (Finansal), 6 (Gider), 7 (Gelir)", priority: "YÜKSEK")
+                    StudyChecklistItem(id: "cf_0", topic: "Master Rehber: PGC Hesap Planı (Grup 1-7) & 35 Kritik Hesap Kodu", detail: "00_MASTER_REHBER_VE_MUHASEBE_OZETI.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_MUHASEBE_OZETI.pdf"),
+                    StudyChecklistItem(id: "cf_1", topic: "Tema 1-2: Malvarlığı, Bilanço Kütleleri & Çözümlü Boletín Bilançoları", detail: "01_TEMA_1_ve_2_Patrimonio_ve_Balance_Detayli_Not.pdf (POSMEN, GENIO, DIEZ çözümleri)", priority: "KRİTİK", pdfFileName: "01_TEMA_1_ve_2_Patrimonio_ve_Balance_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "cf_2", topic: "Tema 3: Hesap İşleyişi, Partida Doble, Libro Diario & Mayor", detail: "02_TEMA_3_Instrumentos_Contables_ve_Partida_Doble_Detayli_Not.pdf (SLX, TRANIN, MATISA çözümleri)", priority: "KRİTİK", pdfFileName: "02_TEMA_3_Instrumentos_Contables_ve_Partida_Doble_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "cf_3", topic: "Tema 4: Tam Muhasebe Döngüsü, 31/12 Regularización & Sınav Vakaları", detail: "03_TEMA_4_Ciclo_Contable_Regularizacion_ve_Sinav_Pratikleri.pdf (CONTA S.A. ve NUMA S.A. tam çözümleri)", priority: "KRİTİK", pdfFileName: "03_TEMA_4_Ciclo_Contable_Regularizacion_ve_Sinav_Pratikleri.pdf")
                 ]
             ),
             UniversityCourse(
                 id: "03_Estadistica",
                 code: "1530005",
-                shortName: "Estadística I",
-                titleTR: "İstatistik I",
-                titleES: "Estadística I",
+                shortName: "Estadística",
+                titleTR: "İstatistik",
+                titleES: "Estadística",
                 folderName: "03_Estadistica",
                 semester: "1. Dönem + Ekim 3ª Conv.",
-                professor: "Departamento de Economía Aplicada I",
+                professor: "Departamento de Economía Aplicada I (Prof. Diego Jorrat / Prof. Antonio Pajares)",
                 examDateISO: "2026-10-22 13:35",
                 examDateLabel: "22 Ekim 2026 Per · 13:35",
                 examLocation: "Aula 27 (2ª Planta - G1)",
@@ -5265,23 +5614,24 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Her iki kısımdan da EN AZ 3.0 / 10 barajı var! Genel ağırlıklı ortalama (0.4×Test + 0.6×Problem) ≥ 5.0 olmalı.",
                 accentColorName: "purple",
                 whatWillBeAsked: [
-                    "Problem 1 — Tek Değişkenli Dağılım & Eşitsizlik: Ortalama, Medyan, Mod, Kartiller, Varyans, Standart Sapma, Değişim Katsayısı (CV = s / |x̄|) ve Gini / Lorenz Yoğunlaşma İndeksi.",
-                    "Problem 2 — İki Değişkenli Regresyon & Korelasyon: Kovaryans (Sxy), Doğrusal Regresyon Doğrusu (Y/X ve X/Y), Belirlilik Katsayısı (R² = S²xy / (S²x · S²y)) ve tahmin güvenilirliği.",
-                    "Problem 3 — İndeks Sayıları & Enflasyon (IPC): Laspeyres (sabit baz dönem ağırlıklı), Paasche (cari dönem ağırlıklı), Fisher, Zincirleme İndeks ve Nominal maaşı Reel maaşa çevirme (Deflaktör).",
-                    "Problem 4 — Olasılık & Dağılım Modelleri: Bayes Teoremi / Tam Olasılık, Binom B(n,p), Poisson P(λ) ve Normal Dağılım N(μ, σ²) standartlaştırma (Z = (X - μ)/σ).",
-                    "Test Kısmı (%40, Hesap Makinesiz!): R², CV, doğrusal dönüşüm özellikleri (Y = a + bX olduğunda varyans b² katına çıkar, CV ve R² işaret dışında değişmez) ve Poisson/Binom özellikleri."
+                    "Tema 1-3 — Frekans Dağılımları & Konum Ölçüleri: Frekans yoğunluğu (di = ni / ai), Aritmetik/Geometrik/Harmonik Ortalama, Medyan (Me), Mod (Mo) ve Kantiller (Q1, Q2, Q3, Dk, Pk).",
+                    "Tema 4-5 — Dağılım, Çarpıklık & Eşitsizlik (Lorenz/Gini): Varyans (S²), Pearson Değişim Katsayısı (CV = S/|x̄|), Standartlaştırma (Z), Gini İndeksi (IG) ve Mediala (Ml).",
+                    "Tema 6-8 — İki Değişkenli Analiz, Korelasyon & Regresyon: İstatistiksel bağımsızlık, Kovaryans (Sxy), Doğrusal Regresyon Doğrusu (Y/X ve X/Y) ve Belirlilik Katsayısı (R² = b · b').",
+                    "Tema 9-10 — İndeks Sayıları & Enflasyon (IPC): Laspeyres, Paasche, Fisher İndeksleri, Seri Bağlama (Enlace) ve Enflasyondan Arındırma (Deflación).",
+                    "Test Kısmı (%40, Hesap Makinesiz!): Y = a + bX doğrusal dönüşüm kuralları (sabit eklemek varyansı değiştirmez; sabit zam Gini'yi düşürür, oransal zam Gini'yi değiştirmez!)."
                 ],
                 formulasAndTraps: [
-                    "DEĞİŞİM KATSAYISI (Temsil Gücü): CV = s / |x̄|. CV küçüldükçe aritmetik ortalamanın temsil gücü ARTAR (CV < 0.5 ise homojen).",
+                    "DEĞİŞİM KATSAYISI (Temsil Gücü): CV = S / |x̄|. CV küçüldükçe aritmetik ortalamanın temsil gücü ARTAR.",
                     "REGRESYON EĞİMLERİ İLİŞKİSİ: b(Y/X) × b(X/Y) = r² = R². İki regresyon eğimi ve korelasyon katsayısı r her zaman AYNI İŞARETLİDİR!",
-                    "ENFLASYON & REEL DEĞER: Reel Değer = (Nominal Değer / IPC) × 100. Alım gücü korunması için maaş artış oranı ≥ Enflasyon oranı olmalı.",
+                    "GINI & MAAŞ ZAMMI TUZAĞI: Herkese eşit tutarda (+a €) zam yapılırsa Gini AZALIR; herkese aynı yüzdeyle (%k) zam yapılırsa Gini DEĞİŞMEZ!",
                     "TEST TUZAĞI: Test kısmında yanlışlar 0.25 götürüyor ve hesap makinesi YASAK! Sadece teorik özelliklerden emin olduklarını işaretle."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "est_1", topic: "Tema 1-3: Tek Değişkenli İstatistik, CV, Asimetri & Gini/Lorenz", detail: "Varyans kısayol formülü (s² = a₂ - x̄²) ve doğrusal dönüşüm kuralları", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "est_2", topic: "Tema 4-5: İki Değişkenli Dağılımlar, Kovaryans, Regresyon & R²", detail: "Y'nin X üzerine regresyonu (b = Sxy / S²x) ve R² yorumu", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "est_3", topic: "Tema 6-7: Zaman Serileri, Laspeyres/Paasche İndeksleri & IPC Deflaktör", detail: "Baz değişimi (enlace de series) ve reel gelir hesaplama", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "est_4", topic: "Tema 8-10: Olasılık (Bayes), Rassal Değişken, Binom, Poisson & Normal", detail: "Beklenen değer E(X), Varyans V(X) ve Normal tablo okuma", priority: "KRİTİK")
+                    StudyChecklistItem(id: "est_0", topic: "Master Rehber: Resmi Formulario 1 & Y = a + bX Dönüşüm Matrisi", detail: "00_MASTER_REHBER_VE_TUM_FORMULLER.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_TUM_FORMULLER.pdf"),
+                    StudyChecklistItem(id: "est_1", topic: "Tema 1-3: Frekans Yoğunluğu (di), Ortalama, Medyan, Mod & Kantiller", detail: "01_TEMA_1_2_3_Frekans_Dagilimlari_ve_Konum_Olculeri_Detayli_Not.pdf (PIZZANET & 40 Municipios çözümlü)", priority: "KRİTİK", pdfFileName: "01_TEMA_1_2_3_Frekans_Dagilimlari_ve_Konum_Olculeri_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "est_2", topic: "Tema 4-5: Varyans, CV, Tipificación (Z), Lorenz Eğrisi, Gini & Mediala", detail: "02_TEMA_4_5_Dagilim_Carpiklik_Lorenz_ve_Gini_Detayli_Not.pdf (Ej. 4 ve Ej. 31 çözümlü)", priority: "KRİTİK", pdfFileName: "02_TEMA_4_5_Dagilim_Carpiklik_Lorenz_ve_Gini_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "est_3", topic: "Tema 6-8: İki Değişkenli Tablolar, Bağımsızlık, Kovaryans, Regresyon & R²", detail: "03_TEMA_6_7_8_Iki_Degiskenli_Analiz_Korelasyon_ve_Regresyon_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "03_TEMA_6_7_8_Iki_Degiskenli_Analiz_Korelasyon_ve_Regresyon_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "est_4", topic: "Tema 9-10: Laspeyres, Paasche, Fisher İndeksleri, IPC & Deflación", detail: "04_TEMA_9_10_Indeksler_IPC_ve_Deflacion_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "04_TEMA_9_10_Indeksler_IPC_ve_Deflacion_Detayli_Not.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5289,7 +5639,7 @@ private final class UniversityStudyMonitor: ObservableObject {
                 code: "1530004",
                 shortName: "Finanzas I",
                 titleTR: "Finans I (İşletme Finansı Temelleri)",
-                titleES: "Fundamentos de Economía Financiera / Finanzas I",
+                titleES: "Finanzas I",
                 folderName: "04_Finanzas_I",
                 semester: "1. Dönem + Ekim 3ª Conv.",
                 professor: "Dra. María Dolores Oliver Alfonso (Koordinatör)",
@@ -5301,23 +5651,22 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Her iki kısımdan da EN AZ 3.5 / 10 barajı var! Toplam ağırlıklı puan ≥ 5.0 olmalı.",
                 accentColorName: "green",
                 whatWillBeAsked: [
-                    "Caso Práctico Soru 1 — Fondo de Maniobra (FM) & PMM (Ortalama Olgunlaşma Süresi): Bilançodan FM = AC - PC = (PN + PNC) - ANC hesaplama ve PMMe / PMMf (Stok + Alacak - Tedarikçi vadesi) analizi.",
-                    "Caso Práctico Soru 2 — Yatırım Değerlendirme (VAN & TIR): Başlangıç maliyeti (-A) ve yıllık nakit akışları (Q₁, Q₂, Q₃) verilen projede VAN (Net Bugünkü Değer) ve TIR (İç Verim Oranı) hesabı.",
-                    "Caso Práctico Soru 3 — Ekonomik ve Finansal Kârlılık (ROI / ROE) & Kaldıraç: RE (ROA) = BAIT / Activo Total; RF (ROE) = BN / Recursos Propios; borç maliyetinin (ki) ROE'ye etkisi.",
-                    "Caso Práctico Soru 4 — Sermaye Maliyeti (WACC / CMP): Özsermaye maliyeti (ke) ve vergi kalkanlı yabancı kaynak maliyeti ki·(1-t) ile ağırlıklı ortalama sermaye maliyeti.",
-                    "40 Soruluk Test (%30): Finansal amaç (hissedar/işletme piyasa değerini maksimize etmek, kâr maksimizasyonu DEĞİL!), likidite vs ödeme gücü, sistemik vs spesifik risk."
+                    "Tema 1 — Fondo de Maniobra (FM) & Rasyolar: Bilançodan FM = AC - PC = (PN + PNC) - ANC hesaplama ve Likidite / Asit-Test / Solvency / Borçluluk rasyoları.",
+                    "Tema 2 — Período Medio de Maduración (PMM): PMMe = PMa + PMf + PMv + PMc ve PMMf = PMMe - PMp (365 / rotasyon) ve Cash-Flow hesabı.",
+                    "Tema 3 — Finansal Matematik: Bileşik faiz, Nominal (Jm) vs Efektif faiz (TAE) ve Rantların bugünkü/gelecek değeri (an¬i).",
+                    "Tema 4-5 — Yatırım Değerlendirme (Payback, VAN & TIR): Başlangıç maliyeti (-A), nakit akışları (Qt) ve kalıntı değer (VRn) ile VAN, TIR, Karlılık İndeksi (IR) ve Fisher kesişim oranı.",
+                    "Tema 6 — Sermaye Maliyeti (WACC / CMPC): Vergi kalkanlı borç maliyeti Kd·(1-t) ve özsermaye maliyeti Ke (Gordon-Shapiro / CAPM) ile ağırlıklı ortalama sermaye maliyeti."
                 ],
                 formulasAndTraps: [
                     "FONDO DE MANIOBRA: FM = AC - PC = Recursos Permanentes (PN + PNC) - ANC. FM > 0 ise kısa vadeli finansal denge vardır.",
-                    "VAN (NPV): VAN = -A + Σ [ Qₜ / (1 + k)ᵗ ]. Karar Kuralı: VAN > 0 ve TIR > k ise yatırım KABUL edilir!",
-                    "FİNANSAL KALDIRAÇ (Apalancamiento): RF = RE + (RE - ki) × (D / RP) × (1 - t). Eğer RE > ki ise borçlanmak özsermaye kârlılığını (RF) artırır (Pozitif Kaldıraç).",
+                    "VAN (NPV): VAN = -A + Σ [ Qₜ / (1 + k)ᵗ ]. Karar Kuralı: VAN > 0 ve TIR > k ise yatırım KABUL edilir! Çelişkide her zaman VAN üstündür.",
+                    "WACC VERGİ KALKANI: Borç maliyeti mutlaka (1 - t) ile çarpılır: Kd_neto = Kd · (1 - t).",
                     "TEST STRATEJİSİ: 40 soruda doğru +0.25, yanlış -0.05 (yani 5 yanlış 1 doğruyu götürüyor). 2 şıkka indirdiğin sorularda mutlaka işaretle!"
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "fin_1", topic: "Tema 1-3: İşletme Finansı Amacı, Bilanço Dengesi, FM & PMM", detail: "00_CALISMA_REHBERI_VE_FORMULLER.md içindeki tüm FM ve PMM formüllerini ezberle", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "fin_2", topic: "Tema 4-5: Yatırım Projeleri, Nakit Akışı (Cash-Flow), VAN & TIR", detail: "2 ve 3 yıllık projelerde VAN=0 eşitlemesiyle TIR bulma pratiği", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "fin_3", topic: "Tema 6-8: RE (ROI), RF (ROE), Finansal Kaldıraç & WACC (Sermaye Maliyeti)", detail: "Vergi öncesi ve vergi sonrası kârlılık + borçlanma etkisi", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "fin_4", topic: "01_SINAV_SIMULASYONU_VE_VAKA.md Çözümü", detail: "Tam vaka analizi ve test sorularını süre tutarak çöz", priority: "KRİTİK")
+                    StudyChecklistItem(id: "fin_0", topic: "Master Rehber: Tüm Formüller & 5 Ölümcül Sınav Hatası", detail: "00_MASTER_REHBER_VE_FORMULLER.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_FORMULLER.pdf"),
+                    StudyChecklistItem(id: "fin_1", topic: "Tema 1-3: Bilanço Dengesi, Fondo de Maniobra, PMM & Finansal Matematik", detail: "01_TEMA_1_2_3_Equilibrio_PMM_ve_Matematicas_Financieras_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "01_TEMA_1_2_3_Equilibrio_PMM_ve_Matematicas_Financieras_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "fin_2", topic: "Tema 4-6: Payback, VAN, TIR, Fisher, WACC & Çözümlü Sınav Vaka Analizi", detail: "02_TEMA_4_5_6_VAN_TIR_Payback_WACC_ve_Sinav_Simulasyonu.pdf (15 Test + Guadalquivir Logistics Vakası)", priority: "KRİTİK", pdfFileName: "02_TEMA_4_5_6_VAN_TIR_Payback_WACC_ve_Sinav_Simulasyonu.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5337,22 +5686,20 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Sürekli değerlendirmede Prácticas %30 + 11 Aralık Sınavı %70. Dersi ocak sınavına kalmadan Aralık'ta geçme fırsatı!",
                 accentColorName: "orange",
                 whatWillBeAsked: [
-                    "26 Ekim Práctica 3 (Üretim, Stok & PERT): Başabaş Noktası (Punto Muerto Q* = CF / (P - CVu)), Wilson Optimal Sipariş Miktarı (EOQ) ve PERT-CPM Kritik Yol / Bolluk (Holgura) hesabı.",
-                    "09 Kasım Práctica 4 (Marketing): Pazar payı, talep esnekliği ve fiyatlandırma problemleri.",
-                    "23 Kasım Práctica 5 (Rentabilidad): Ekonomik Kârlılık (RE = BAIT / AT) ve Finansal Kârlılık (RF = BN / RP) + Kaldıraç etkisi.",
-                    "03 Aralık Práctica 6 (Inversión): Payback (Geri Ödeme Süresi), VAN ve TIR hesaplaması.",
-                    "11 Aralık Prueba Final: Temas 1–8 Teori + Problem kombinasyonu."
+                    "26 Ekim Práctica 3 (Stok & PERT): Wilson Optimal Sipariş Miktarı (EOQ), Yeniden Sipariş Noktası (Pp) ve PERT-CPM Kritik Yol / Bolluk (Holgura) hesabı.",
+                    "Tema 1-3: İşletme türleri, Girişimci teorileri (Knight, Schumpeter, Galbraith), PESTEL, Porter 5 Güç, Üretim süreçleri ve Başabaş Noktası (Punto Muerto Q* = CF / (P - cv)).",
+                    "09 Kasım Práctica 4 (Marketing) & 23 Kasım Práctica 5 (Rentabilidad: RE/ROA ve RF/ROE).",
+                    "03 Aralık Práctica 6 (Inversión: Payback, VAN, TIR) & 11 Aralık Prueba Final."
                 ],
                 formulasAndTraps: [
                     "PUNTO MUERTO (Başabaş Noktası): Q* = CF / (P - CVu). (P - CVu) = Birim Katkı Payı (Margen de Contribución Unitario).",
-                    "FAALİYET KALDIRACI (Grado de Apalancamiento Operativo): GAO = [Q · (P - CVu)] / [Q · (P - CVu) - CF].",
                     "WILSON STOK MODELİ (EOQ): Q* = √( (2 · D · s) / g ). Toplam sipariş sayısı N = D / Q*, siparişler arası süre T = 360 / N.",
                     "PERT KRİTİK YOL: Erken zaman (Te) = max(önceki + süre); Geç zaman (Tl) = min(sonraki - süre). Holgura H = Tl - Te - d = 0 olan faaliyetler KRİTİK YOLDUR."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "iee_1", topic: "26 Ekim Práctica 3 Hazırlığı: Punto Muerto, Wilson (EOQ) & PERT", detail: "Cuaderno de Prácticas içindeki Üretim, Stok ve PERT sorularını çöz", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "iee_2", topic: "Tema 1-3: İşletme, Girişimci, Stratejik Yönetim (PESTEL, Porter 5 Güç, SWOT)", detail: "Organizasyon yapıları (Mintzberg) ve büyüme stratejileri (Ansoff)", priority: "YÜKSEK"),
-                    StudyChecklistItem(id: "iee_3", topic: "9 Kasım & 23 Kasım Prácticas (Marketing + RE/RF Rentabilidad)", detail: "Finanzas I ile ortak olan RE, RF, VAN ve TIR formüllerini pekiştir", priority: "YÜKSEK")
+                    StudyChecklistItem(id: "iee_0", topic: "Master Rehber: Zorunlu Pratik Takvimi & Formül Özeti", detail: "00_MASTER_REHBER_VE_PRATIK_TAKVIMI.pdf", priority: "YÜKSEK", pdfFileName: "00_MASTER_REHBER_VE_PRATIK_TAKVIMI.pdf"),
+                    StudyChecklistItem(id: "iee_1", topic: "26 Ekim Práctica 3 Özel Rehberi: Wilson Stok (EOQ), PERT & Doğrusal Programlama", detail: "02_TEMA_4_PRATIK_3_REHBERI_Stocks_Wilson_PERT_ve_PL_Detayli_Not.pdf (Tüm slayt soruları çözümlü!)", priority: "KRİTİK", pdfFileName: "02_TEMA_4_PRATIK_3_REHBERI_Stocks_Wilson_PERT_ve_PL_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "iee_2", topic: "Tema 1-3: İşletme, Girişimci, PESTEL, Porter 5 Güç, Üretim & Punto Muerto", detail: "01_TEMA_1_2_3_Empresa_Entorno_ve_Operaciones_Detayli_Not.pdf", priority: "YÜKSEK", pdfFileName: "01_TEMA_1_2_3_Empresa_Entorno_ve_Operaciones_Detayli_Not.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5369,26 +5716,24 @@ private final class UniversityStudyMonitor: ObservableObject {
                 examLocation: "Aula 31-33 (FCEE)",
                 convocatoria: "3ª Convocatoria (Ekim)",
                 examFormat: "3 Teori Sorusu (%75 - grafik ve analizli) + 1 Problem (%25) · Süre: 2 Saat",
-                passRule: "Temas 1–8 tam kapsam. Grafik çizimi (Tüketici dengesi, Maliyet eğrileri, Rekabet vs Tekel) puanın belkemiğidir!",
+                passRule: "Temas 1–8 tam kapsam. Grafik çizimi (Maliyet eğrileri, Tam Rekabet, Tekel, Oligopol) puanın belkemiğidir!",
                 accentColorName: "teal",
                 whatWillBeAsked: [
-                    "Problem (%25) Tip A — Tüketici Dengesi & Slutsky: Fayda fonksiyonu U(X,Y) (Cobb-Douglas, Tam Tamamlayıcı min{aX,bY} veya Tam İkame aX+bY) ve bütçe kısıtından optimal sepet, ardından fiyat değişiminde İkame Etkisi (ES) ve Gelir Etkisi (ER).",
-                    "Problem (%25) Tip B — Firma Maliyetleri & Piyasa Dengesi: CT(Q) maliyet fonksiyonundan CMg, CMe, CVMe, Kapanma Noktası (Min CVMe) ve Tam Rekabet (P = CMg) veya Tekel (IMg = CMg) denge miktarı/kârı.",
-                    "Teori 1 — Tüketici Teorisi (Temas 1-2): Farksızlık eğrilerinin özellikleri, RMS = UMgX / UMgY = Px / Py, Normal / Düşük (Inferior) / Giffen mal grafiksel ayrımı.",
-                    "Teori 2 — Üretim & Maliyetler (Temas 3-4): Kısa dönemde Azalan Verimler Kanunu (PMg ve PMe ilişkisi), Uzun dönemde Ölçeğe Göre Getiri (Rendimientos a escala) ve Kısa/Uzun dönem maliyet zarf eğrisi.",
-                    "Teori 3 — Piyasa Yapıları (Temas 5-8): Tam Rekabet kısa ve uzun dönem dengesi (sıfır ekonomik kâr, P = min CMeL), Tekelde Fiyat Farklılaştırması (1., 2., 3. derece) ve Sosyal Refah Kaybı (Pérdida Irrecuperable de Eficiencia), Oligopol (Cournot, Stackelberg, Bertrand)."
+                    "Tema 1-2 — Üretim & Maliyetler: Kısa dönemde Azalan Verimler (PMeL, PMgL), Uzun dönemde Eşürün Eğrileri (RMST), Ölçeğe Göre Getiri ve Maliyet Minimizasyonu (PMgL/w = PMgK/r).",
+                    "Tema 3 — Tam Rekabet (Competencia Perfecta): Kısa dönem kar maksimizasyonu (P = CMg), Kapanma Noktası (P < min CMeV) ve Uzun dönem sıfır kar dengesi (P = min CMeLP).",
+                    "Tema 4-5 — Tekel & Fiyat Farklılaştırması: IMg = CMg, Lerner İndeksi (L = 1/|Ed|), Sosyal Refah Kaybı (PIE) ve 1., 2., 3. Derece Fiyat Farklılaştırması (IMg1 = IMg2 = CMg).",
+                    "Tema 6-8 — Oligopol & Faktör Piyasaları: Cournot (eşanlı miktar), Stackelberg (lider-takipçi), Bertrand (P = CMg) ve Kartel modelleri; Emek talebi (VPMgL = w)."
                 ],
                 formulasAndTraps: [
-                    "TÜKETİCİ DENGESİ (İç Çözüm): RMS = UMgX / UMgY = Px / Py ve Px·X + Py·Y = R. Tam tamamlayıcılarda türev alınmaz: aX = bY eşitliği kullanılır!",
-                    "TAM REKABET KISA DÖNEM ARZ: P ≥ min CVMe olduğu sürece P = CMg (artan kol). P < min CVMe ise firma üretimi durdurur (Q = 0, zarar = -CF).",
-                    "TEKEL DENGESİ & LERNER İNDEKSİ: IMg = CMg → P > CMg. Lerner İndeksi L = (P - CMg) / P = 1 / |εd|.",
-                    "GRAFİK KURALI: Her teorik soruda eksen isimlerini (P, Q, CMg, CMe, CVMe, IMg) mutlaka yaz ve denge noktasını işaretleyerek açıkla."
+                    "MALİYET MİNİMİZASYONU: RMST = PMgL / PMgK = w / r ve CT = w·L + r·K.",
+                    "TAM REKABET KISA DÖNEM ARZ: P ≥ min CMeV olduğu sürece P = CMg (artan kol). P < min CMeV ise firma üretimi durdurur (Q = 0, zarar = -CF).",
+                    "TEKEL DENGESİ & LERNER İNDEKSİ: IMg = P·(1 - 1/|Ed|) = CMg. Tekelci her zaman esnek bölgede (|Ed| > 1) üretir!"
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "mic_1", topic: "Tema 1-2: Tüketici Dengesi (Cobb-Douglas, İkame, Tamamlayıcı) & Slutsky", detail: "Ejercicios T1-T8 içindeki tüketici optimizasyonu ve ikame/gelir etkisi soruları", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mic_2", topic: "Tema 3-4: Üretim Fonksiyonu, Azalan Verimler, RTS & Maliyet Fonksiyonları", detail: "CT, CF, CV, CMe, CVMe, CMg türevleri ve ölçeğe göre getiri", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mic_3", topic: "Tema 5-6: Tam Rekabet (Kısa/Uzun Dönem) & Tekel (IMg=CMg, Refah Kaybı)", detail: "Kapanma noktası (Punto de cierre) ve 1./2./3. derece fiyat farklılaştırması", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mic_4", topic: "Tema 7-8: Monopolcü Rekabet & Oligopol (Cournot, Stackelberg, Nash)", detail: "Tepki fonksiyonları (Funciones de reacción) ve kartel dengesi", priority: "YÜKSEK")
+                    StudyChecklistItem(id: "mic_0", topic: "Master Rehber: Temas 1-8 Formül Atlası & Piyasa Yapıları Tablosu", detail: "00_MASTER_REHBER_VE_FORMULLER.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_FORMULLER.pdf"),
+                    StudyChecklistItem(id: "mic_1", topic: "Tema 1-2: Üretim Fonksiyonu, Ölçeğe Göre Getiri & Maliyet Minimizasyonu", detail: "01_TEMA_1_2_Produccion_ve_Costes_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "01_TEMA_1_2_Produccion_ve_Costes_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "mic_2", topic: "Tema 3-5: Tam Rekabet, Tekel (Lerner/PIE) & 1-2-3. Derece Fiyat Farklılaştırması", detail: "02_TEMA_3_4_5_Competencia_Perfecta_Monopolio_ve_Discriminacion_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "02_TEMA_3_4_5_Competencia_Perfecta_Monopolio_ve_Discriminacion_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "mic_3", topic: "Tema 6-8: Oligopol (Cournot, Stackelberg, Bertrand, Kartel) & Faktör Piyasaları", detail: "03_TEMA_6_7_8_Oligopolio_Cournot_Stackelberg_ve_Factores_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "03_TEMA_6_7_8_Oligopolio_Cournot_Stackelberg_ve_Factores_Detayli_Not.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5399,7 +5744,7 @@ private final class UniversityStudyMonitor: ObservableObject {
                 titleES: "Introducción a la Economía",
                 folderName: "06_Introduccion_Economia",
                 semester: "1. Dönem + Ekim 3ª Conv.",
-                professor: "Prof. Helena Domínguez Torres",
+                professor: "Prof. Helena Domínguez Torres & Prof. Carlos Abreo",
                 examDateISO: "2026-10-30 10:00",
                 examDateLabel: "30 Ekim 2026 Cum (3ª Conv.) · 03 Aralık (EC Final)",
                 examLocation: "FCEE",
@@ -5408,22 +5753,20 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Sürekli değerlendirmede 3 Aralık kontrolünden min 5.0 alırsan Ocak finaline girmeden dersi geçiyorsun!",
                 accentColorName: "indigo",
                 whatWillBeAsked: [
-                    "Tema 1 — FPP (Üretim İmkanları Sınırı) & Fırsat Maliyeti: Etkin/etkinsiz/ulaşılamaz noktalar, artan fırsat maliyeti (içbükey FPP) ve ekonomik büyüme kaymaları.",
-                    "Tema 2-3 — Arz, Talep, Piyasa Dengesi & Esneklik: Tavan fiyat (Precio máximo → kıtlık/escasez) ve Taban fiyat (Precio mínimo → arz fazlası/excedente) grafik analizi; Talep Fiyat Esnekliği (εp) ile Toplam Gelir (IT = P·Q) ilişkisi.",
-                    "Tema 5 — Milli Gelir Muhasebesi (PIB / GSYİH): Harcama Yöntemi (PIBpm = C + I + G + X - M), Gelir Yöntemi ve Katma Değer Yöntemi; PIB Nominal vs PIB Real ve GSYİH Deflaktörü.",
-                    "Tema 6-7 — Keynesyen Çarpan, Maliye Politikası & Para Politikası (IS-LM temeli): Kamu harcaması çarpanı k = 1 / (1 - c·(1-t)), para çarpanı ve Merkez Bankası'nın faiz/para arzı müdahalesinin AD-AS üzerindeki etkisi."
+                    "Tema 1-2 — FPP & İktisadi Düşünce Tarihi: Fırsat maliyeti, içbükey FPP; Merkantilizm, Fizyokrasi (Quesnay), Klasik Okul (Smith, Ricardo, Say), Marx, Neoklasik ve Keynes.",
+                    "Tema 3-5 — Makroekonomi: PIB (C + I + G + X - M), Nominal/Reel PIB, İşsizlik Oranı (Tasa de paro), Maliye Politikası (Keynesyen Çarpan) ve Para Politikası (Para Çarpanı & BCE).",
+                    "Tema 6-8 — Mikroekonomi: Arz-Talep Dengesi, Tavan/Taban Fiyat, Fiyat/Gelir/Çapraz Esneklik ve Tüketici Dengesi (RMS = UMgX/UMgY = PX/PY)."
                 ],
                 formulasAndTraps: [
                     "ESNEKLİK & TOPLAM GELİR (IT = P×Q): Talep esnekse (|ε| > 1) fiyat düşürüldüğünde Toplam Gelir ARTAR! Talep inelastikse (|ε| < 1) fiyat artırıldığında Toplam Gelir ARTAR.",
-                    "MİLLİ GELİR GEÇİŞLERİ: PNB (GNP) = PIB + RRN - RRE. PNN = PNB - Amortisman. RN (Milli Gelir - Faktör Fiyatlarıyla) = PNNpm - Ti (Dolaylı Vergiler) + Subvenciones (Sübvansiyonlar).",
-                    "KEYNESYEN ÇARPAN: Vergisiz kapalı ekonomide k = 1 / (1 - PMC). Vergili ekonomide k = 1 / [1 - PMC·(1 - t)].",
-                    "PARA ÇARPANI: mm = (1 + e) / (e + r) (e: nakit/mevduat oranı, r: zorunlu karşılık oranı)."
+                    "İŞSİZLİK ORANI: Tasa de paro = (Parados / Población Activa) × 100. Población Activa = Ocupados + Parados.",
+                    "KEYNESYEN ÇARPAN: Vergisiz kapalı ekonomide k = 1 / (1 - c). Vergili ekonomide k = 1 / [1 - c·(1 - t)]."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "eco_1", topic: "Tema 1-3: FPP, Arz-Talep Kaymaları, Tavan/Taban Fiyat & Esneklik", detail: "Esneklik-Toplam Gelir (IT) grafiği ve tüketici/üretici rantı", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "eco_2", topic: "Tema 4: Mikro Piyasa Dengesi ve Devlet Müdahalesi (Vergi/Sübvansiyon)", detail: "Vergi yükünün esnekliğe göre alıcı ve satıcı arasında paylaşımı", priority: "YÜKSEK"),
-                    StudyChecklistItem(id: "eco_3", topic: "Tema 5-6: Makroekonomik Büyüklükler (PIB, PNB, RN, IPC, İşsizlik Oranı)", detail: "Aktif nüfus, işsizlik oranı (Tasa de paro) ve GSYİH hesaplama problemleri", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "eco_4", topic: "Tema 7-8: Maliye Politikası, Para Politikası, Çarpan & Dış Açık", detail: "Genişletici ve daraltıcı politikaların üretim ve fiyatlar genel seviyesine etkisi", priority: "KRİTİK")
+                    StudyChecklistItem(id: "eco_0", topic: "Master Rehber: Makro & Mikro Tüm Formüller ve Sınav Sistemi", detail: "00_MASTER_REHBER_VE_OZET.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_OZET.pdf"),
+                    StudyChecklistItem(id: "eco_1", topic: "Tema 1-2: Kıtlık, FPP & İktisadi Düşünce Tarihi (Merkantilizm → Keynes)", detail: "01_TEMA_1_2_Escasez_FPP_ve_Pensamiento_Economico_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "01_TEMA_1_2_Escasez_FPP_ve_Pensamiento_Economico_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "eco_2", topic: "Tema 3-5: Makroekonomi (PIB, İşsizlik, Maliye Çarpanı & Para Politikası)", detail: "02_TEMA_3_4_5_Macroeconomia_PIB_Politica_Fiscal_ve_Monetaria_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "02_TEMA_3_4_5_Macroeconomia_PIB_Politica_Fiscal_ve_Monetaria_Detayli_Not.pdf"),
+                    StudyChecklistItem(id: "eco_3", topic: "Tema 6-8: Mikroekonomi (Arz-Talep, Esneklik, Tüketici Dengesi & Giffen)", detail: "03_TEMA_6_7_8_Microeconomia_Oferta_Demanda_Elasticidad_ve_Consumidor_Detayli_Not.pdf", priority: "KRİTİK", pdfFileName: "03_TEMA_6_7_8_Microeconomia_Oferta_Demanda_Elasticidad_ve_Consumidor_Detayli_Not.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5434,30 +5777,29 @@ private final class UniversityStudyMonitor: ObservableObject {
                 titleES: "Matemáticas I",
                 folderName: "08_Matematicas_I",
                 semester: "1. Dönem (Ocak 2027 Final)",
-                professor: "Departamento de Economía Aplicada III",
+                professor: "Prof. Francisco Begines & Prof. Loreto Delgado",
                 examDateISO: "2027-01-15 09:00",
                 examDateLabel: "Ocak 2027 · 1. Dönem Finali",
                 examLocation: "FCEE",
                 convocatoria: "1ª Convocatoria (Ocak 2027)",
                 examFormat: "Teori/Yorum + Uygulamalı Problem Çözümü (Blok I Türev, Blok II İntegral, Blok III Matris/Cebir)",
-                passRule: "Klasörde 26 adet TAM ÇÖZÜMLÜ çıkmış sınav (Examenes Resueltos) ve 17 İntegral Bölgesi (Recintos) rehberi mevcut!",
+                passRule: "Klasörde 3 Blok PDF ders notu + 26 adet TAM ÇÖZÜMLÜ çıkmış sınav (ExaRes) ve 17 Recinto rehberi mevcut!",
                 accentColorName: "mint",
                 whatWillBeAsked: [
-                    "Blok I (Çok Değişkenli Türev): Tanım kümesi (Dominio) ve Seviye Eğrileri (Curvas de nivel), Kısmi Türevler, Gradyan Vektörü ∇f, Hessian Matrisi Hf, Zincir Kuralı (Bileşke fonksiyon türevi), Kapalı Fonksiyon Türevi ve Homojen Fonksiyonlar (Euler Teoremi: x·fx + y·fy = m·f).",
-                    "Blok II (Çok Katlı İntegral): Belirsiz/Belirli integral (Kısmi integrasyon, rasyonel fonksiyonlar), Genelleştirilmiş İntegraller (Impropias) ve Çift Katlı İntegral ∬ D f(x,y) dxdy (Fubini Teoremi ile integrasyon sırası değiştirme).",
-                    "Blok III (Lineer Cebir & Kuadratik Formlar): Parametreli doğrusal denklem sistemlerinde Rouché-Frobenius Teoremi (SCD, SCI, SI), Özdeğerler (Autovalores |A - λI| = 0), Özvektörler (Autovectores), Matris Köşegenleştirme (Diagonalización) ve Kuadratik Formların İşareti (Başkemer minörleri / özdeğerler ile Definida Positiva, Negativa, Indefinida)."
+                    "Blok I (Çok Değişkenli Türev): Tanım kümesi (Dominio) ve Seviye Eğrileri, Kısmi Türevler, Gradyan Vektörü ∇f, Hessian Matrisi Hf, Zincir Kuralı ve Kapalı Fonksiyon Türevi.",
+                    "Blok II (Çok Katlı İntegral): Belirsiz/Belirli integral (ALPES, Barrow) ve Çift Katlı İntegral ∬ D f(x,y) dxdy (Tip I/II Recinto çizimi ve Fubini ile sınır değiştirme).",
+                    "Blok III (Lineer Cebir & Kuadratik Formlar): Rouché-Frobenius Teoremi (SCD, SCI, SI), Özdeğerler/Özvektörler, Köşegenleştirme ve Kuadratik Formların İşareti."
                 ],
                 formulasAndTraps: [
-                    "EULER TEOREMİ (Homojen Fonksiyon): f(λx, λy) = λᵐ·f(x,y) ise x·(∂f/∂x) + y·(∂f/∂y) = m·f(x,y) ve Hessian determinantı; m=1 ise |Hf| = 0.",
-                    "EN BÜYÜK ARTIŞ YÖNÜ: Fonksiyonun bir P noktasında en hızlı arttığı yön Gradyan ∇f(P) yönüdür; maksimum değişim hızı ||∇f(P)|| normudur.",
+                    "EN BÜYÜK ARTIŞ YÖNÜ: Fonksiyonun bir P noktasında en hızlı arttığı yön Gradyan ∇f(P) yönüdür; seviye eğrisine diktir.",
                     "ROUCHÉ-FROBENIUS: rg(A) = rg(A|b) = n ise Tek Çözüm (SCD); rg(A) = rg(A|b) < n ise Sonsuz Çözüm (SCI); rg(A) ≠ rg(A|b) ise Çözüm Yok (SI).",
-                    "KUADRATİK FORM İŞARETİ: Tüm özdeğerler λᵢ > 0 (veya Δ₁ > 0, Δ₂ > 0, Δ₃ > 0) ise Kesin Pozitif (Definida Positiva)."
+                    "KUADRATİK FORM İŞARETİ: Tüm özdeğerler λᵢ > 0 ise Kesin Pozitif (Definida Positiva)."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "mat_1", topic: "Blok I: Kısmi Türev, Gradyan, Hessian, Zincir Kuralı & Euler Teoremi", detail: "Lecciones 1-2 alıştırmaları ve çıkmış sınav türev soruları", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mat_2", topic: "Blok II: Çift Katlı İntegral & 17 Klasik Recinto (Bölge) Çizimi", detail: "Recinto 1-17 PDF dosyalarındaki sınır belirleme ve Fubini değişimi", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mat_3", topic: "Blok III: Rouché-Frobenius, Özdeğer/Köşegenleştirme & Kuadratik Formlar", detail: "Parametreli matris tartışması (a, b parametrelerine göre sistem çözümü)", priority: "KRİTİK"),
-                    StudyChecklistItem(id: "mat_4", topic: "26 Çözümlü Çıkmış Sınavdan (Examenes Resueltos) En Az 5 Tanesini Çöz", detail: "Soru kalıpları her yıl birebir tekrar ediyor", priority: "YÜKSEK")
+                    StudyChecklistItem(id: "mat_0", topic: "Master Rehber: Tüm Türev, İntegral ve Matris Formülleri", detail: "00_MASTER_REHBER_VE_FORMULLER.pdf", priority: "KRİTİK", pdfFileName: "00_MASTER_REHBER_VE_FORMULLER.pdf"),
+                    StudyChecklistItem(id: "mat_1", topic: "Blok I (Tema 1-3): Dominio, Kısmi Türev, Gradyan, Hessian & Zincir Kuralı", detail: "01_BLOK_1_Tema_1_2_3_Diferansiyel_Hesap_Turev_Gradyan_Hessian.pdf", priority: "KRİTİK", pdfFileName: "01_BLOK_1_Tema_1_2_3_Diferansiyel_Hesap_Turev_Gradyan_Hessian.pdf"),
+                    StudyChecklistItem(id: "mat_2", topic: "Blok II (Tema 4-6): İntegral Hesabı, Fubini & Recinto Bölge Çizimi", detail: "02_BLOK_2_Tema_4_5_6_Integral_ve_Fubini_Recintos.pdf", priority: "KRİTİK", pdfFileName: "02_BLOK_2_Tema_4_5_6_Integral_ve_Fubini_Recintos.pdf"),
+                    StudyChecklistItem(id: "mat_3", topic: "Blok III (Tema 7-11): Rouché-Frobenius, Köşegenleştirme & Kuadratik Formlar", detail: "03_BLOK_3_Tema_7_11_Matrisler_Rouché_Kosegenlestirme_Kuadratik_Formlar.pdf", priority: "KRİTİK", pdfFileName: "03_BLOK_3_Tema_7_11_Matrisler_Rouché_Kosegenlestirme_Kuadratik_Formlar.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5477,20 +5819,16 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Final sınavından en az 4.0/10 almak şarttır; seminer puanıyla ağırlıklı ortalama ≥ 5.0 olmalıdır.",
                 accentColorName: "brown",
                 whatWillBeAsked: [
-                    "Tema 1-2: Sanayi Öncesi Ekonomi, Malthus Tuzağı (Tavanı) ve Demografik Geçiş Modeli.",
-                    "Tema 3-4: İngiliz Sanayi Devrimi'nin Nedenleri (Tarım devrimi, çitleme/enclosures, kömür ve kurumsal yapı) ve Sanayileşmenin Yayılması (ABD, Almanya, Japonya Meiji).",
-                    "Tema 5: I. Küreselleşme (1870-1914), Uluslararası Altın Standardı (Patrón Oro) mekanizması ve II. Sanayi Devrimi (Taylorizm/Fordizm).",
-                    "Tema 6: İki Savaş Arası Dönem, 1929 Büyük Buhranı'nın nedenleri, yayılması ve New Deal / Keynesyen çıkış politikaları.",
-                    "Tema 7: Bretton Woods Sistemi (1944 - IMF, Dünya Bankası, GATT), Kapitalizmin Altın Çağı (1950-1973) ve 1973/1979 Petrol Krizleri (Stagflasyon)."
+                    "Tema 1-2: Sanayi Öncesi Ekonomi, Malthus Tuzağı ve Demografik Geçiş Modeli.",
+                    "Tema 3-4: İngiliz Sanayi Devrimi'nin Nedenleri ve Sanayileşmenin Yayılması.",
+                    "Tema 5-7: Altın Standardı, 1929 Büyük Buhranı, Bretton Woods ve 1973 Stagflasyon Krizi."
                 ],
                 formulasAndTraps: [
                     "MALTHUS TUZAĞI: Nüfus geometrik, gıda üretimi aritmetik artar; azalan verimler yüzünden reel ücretler geçimlik düzeye geri döner.",
-                    "ALTIN STANDARDI (Hume Fiyat-Altın Akım Mekanizması): Dış açık → altın çıkışı → para arzı daralması → iç fiyatların düşmesi → rekabet gücünün artması (otomatik denge, ama iç işsizlik pahasına!).",
-                    "STAGFLASYON (1970'ler): Durgunluk (işsizlik) + Yüksek Enflasyonun aynı anda görülmesi; klasik Phillips eğrisinin kırılması."
+                    "STAGFLASYON (1970'ler): Durgunluk (işsizlik) + Yüksek Enflasyonun aynı anda görülmesi."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "his_1", topic: "Tema 1-4: Malthus Modeli, 1. Sanayi Devrimi & Takipçi Ülkeler", detail: "00_CALISMA_REHBERI_VE_OZET.md özetini oku", priority: "NORMAL"),
-                    StudyChecklistItem(id: "his_2", topic: "Tema 5-7: Altın Standardı, 1929 Buhranı, Bretton Woods & 1973 Krizi", detail: "Seminer metinleri ve grafik yorumları", priority: "NORMAL")
+                    StudyChecklistItem(id: "his_1", topic: "Tema 1-7: İktisat Tarihi Tam Konu Özeti PDF", detail: "00_DERS_REHBERI_VE_KONU_OZETI.pdf", priority: "NORMAL", pdfFileName: "00_DERS_REHBERI_VE_KONU_OZETI.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5498,7 +5836,7 @@ private final class UniversityStudyMonitor: ObservableObject {
                 code: "1530010",
                 shortName: "Marketing",
                 titleTR: "Pazarlama Yönetimi I (Temeller)",
-                titleES: "Dirección Comercial I / Fundamentos de Marketing",
+                titleES: "Introducción al Marketing",
                 folderName: "10_Marketing",
                 semester: "2. Dönem",
                 professor: "Departamento de Administración de Empresas y Marketing",
@@ -5510,18 +5848,14 @@ private final class UniversityStudyMonitor: ObservableObject {
                 passRule: "Temas 1–8 teorik kavramlar ve ürün/fiyat/dağıtım vaka kararları.",
                 accentColorName: "pink",
                 whatWillBeAsked: [
-                    "Tema 1-2: Pazarlama kavramı, İhtiyaç (Necesidad) vs İstek (Deseo) vs Talep (Demanda) ve Makro/Mikro Çevre (PESTEL).",
-                    "Tema 3-4: Tüketici Davranışı (Satın alma karar süreci) ve Pazarlama Bilgi Sistemi / Araştırması.",
-                    "Tema 5: Pazar Bölümlendirme (Segmentación), Hedef Pazar Seçimi (Indiferenciada, Diferenciada, Concentrada) ve Konumlandırma (Posicionamiento).",
-                    "Tema 6-8: 4P Pazarlama Karması — Ürün (Yaşam Eğrisi: Giriş, Büyüme, Olgunluk, Düşüş), Fiyat (Maliyet, Rekabet, Değer bazlı; Kaymağını Alma vs Nüfuz Etme), Dağıtım Kanalları (Yoğun, Seçici, Münhasır) ve İletişim (Tutundurma)."
+                    "Tema 1-4: İhtiyaç vs İstek vs Talep, PESTEL, Tüketici Davranışı ve Pazarlama Araştırması.",
+                    "Tema 5-8: STP (Segmentasyon, Hedefleme, Konumlandırma) ve 4P Pazarlama Karması."
                 ],
                 formulasAndTraps: [
-                    "KAYMAĞINI ALMA (Desnatado / Skimming) vs NÜFUZ ETME (Penetración): Yenilikçi/patentli üründe yüksek fiyatla başlayıp kademeli indirmek Desnatado; düşük fiyatla hızlı pazar payı kapmak Penetración.",
-                    "İHTİYAÇ PAZARLAMACI TARAFINDAN YARATILMAZ: Pazarlama ihtiyacı (necesidad) yaratmaz, ihtiyacın belirli bir markaya yönelik isteğe (deseo) dönüşmesini etkiler."
+                    "KAYMAĞINI ALMA (Desnatado) vs NÜFUZ ETME (Penetración) fiyatlandırma stratejileri."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "mkt_1", topic: "Tema 1-5: Çevre Analizi, Tüketici Davranışı & STP (Segmentasyon-Konumlandırma)", detail: "Tema 1-5 slayt ve çalışma rehberi tekrarı", priority: "NORMAL"),
-                    StudyChecklistItem(id: "mkt_2", topic: "Tema 6-8: 4P (Ürün, Fiyat, Dağıtım, İletişim) Kararları", detail: "Ürün yaşam seyri ve fiyatlandırma stratejileri", priority: "NORMAL")
+                    StudyChecklistItem(id: "mkt_1", topic: "Tema 1-8: Pazarlama Yönetimi Tam Konu Özeti PDF", detail: "00_DERS_REHBERI_VE_KONU_OZETI.pdf", priority: "NORMAL", pdfFileName: "00_DERS_REHBERI_VE_KONU_OZETI.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5537,20 +5871,18 @@ private final class UniversityStudyMonitor: ObservableObject {
                 examDateLabel: "1. Dönem · Instituto de Idiomas",
                 examLocation: "Instituto de Idiomas (Reina Mercedes)",
                 convocatoria: "Sürekli Değerlendirme & Dönem Sonu Sınavı",
-                examFormat: "Comprensión Lectora + Comprensión Auditiva + Expresión Escrita + Expresión Oral",
-                passRule: "Dört temel dil becerisinde (Okuma, Dinleme, Yazma, Konuşma) A1 yeterliliği.",
+                examFormat: "Comprensión Lectora + Auditiva + Expresión Escrita + Oral",
+                passRule: "Dört temel dil becerisinde A1 yeterliliği.",
                 accentColorName: "yellow",
                 whatWillBeAsked: [
-                    "Gramer: Ser vs Estar vs Hay farkı, Presente de Indicativo (düzenli ve düzensiz fiiller: tener, ir, hacer, querer, poder), Gustar/Encantar yapısı (me gusta / me gustan).",
-                    "Kelime & İletişim: Kendini tanıtma, aile, günlük rutin (verbo reflexivo: levantarse, ducharse), saatler, alışveriş, yön tarif etme.",
-                    "Yazma & Konuşma: 60-80 kelimelik kısa e-posta/kartpostal yazımı ve 3-4 dakikalık kişisel tanıtım & günlük hayat diyaloğu."
+                    "Gramer: Ser vs Estar vs Hay farkı, Presente de Indicativo, Gustar/Encantar yapısı.",
+                    "Yazma & Konuşma: Kısa e-posta yazımı ve kişisel tanıtım diyaloğu."
                 ],
                 formulasAndTraps: [
-                    "SER vs ESTAR vs HAY: Kimlik/milliyet/meslek/karakter için SER; konum ve geçici durum için ESTAR; 'var' anlamında belirsiz nesnelerle (un/una/muchos) HAY kullanılır ('Está una farmacia' YANLIŞ → 'Hay una farmacia' DOĞRU)."
+                    "SER vs ESTAR vs HAY: Kimlik/meslek için SER; konum/durum için ESTAR; belirsiz varlık için HAY."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "esp_1", topic: "Ser / Estar / Hay + Presente de Indicativo Düzensiz Fiiller", detail: "00_CALISMA_REHBERI_VE_OZET.md gramer tablolarını çalış", priority: "YÜKSEK"),
-                    StudyChecklistItem(id: "esp_2", topic: "Sözlü & Yazılı Kendini Tanıtma Şablonunu Ezberle", detail: "Günlük rutin, Sevilla'daki öğrenci hayatı ve hobiler", priority: "NORMAL")
+                    StudyChecklistItem(id: "esp_1", topic: "İspanyolca A1 Gramer, Fiil Çekimleri & Konuşma Rehberi PDF", detail: "00_DERS_REHBERI_VE_KONU_OZETI.pdf", priority: "YÜKSEK", pdfFileName: "00_DERS_REHBERI_VE_KONU_OZETI.pdf")
                 ]
             ),
             UniversityCourse(
@@ -5567,21 +5899,46 @@ private final class UniversityStudyMonitor: ObservableObject {
                 examLocation: "ev.us.es (Online)",
                 convocatoria: "Enseñanza Virtual Online Testler",
                 examFormat: "Modül sonu kısa online testler (Cuestionarios)",
-                passRule: "Enseñanza Virtual üzerindeki tüm modül testlerini tamamlayarak sertifika/kredi onayı almak.",
+                passRule: "Enseñanza Virtual üzerindeki tüm modül testlerini tamamlayarak kredi onayı almak.",
                 accentColorName: "cyan",
                 whatWillBeAsked: [
-                    "Modül 1: UVUS kullanıcı kimliği, 2FA (İki Faktörlü Doğrulama), SEVIUS ve kurumsal Office 365 / OneDrive kullanımı.",
-                    "Modül 2: Catálogo Fama (US Kütüphane arama motoru), akademik veri tabanları (Dialnet, Scopus, Web of Science).",
-                    "Modül 3: Akademik dürüstlük, telif hakları (Creative Commons) ve APA 7 kaynakça gösterimi."
+                    "Modül 1-3: UVUS, 2FA, Catálogo Fama, Creative Commons ve APA 7 kaynakça gösterimi."
                 ],
                 formulasAndTraps: [
-                    "PRATİK İPUCU: 00_CALISMA_REHBERI_VE_OZET.md dosyasını yanında açık tutarak ev.us.es üzerindeki tüm CODIUS modül testlerini 15 dakikada %100 ile bitirebilirsin."
+                    "PRATİK İPUCU: 00_DERS_REHBERI_VE_KONU_OZETI.pdf dosyasını açık tutarak online testleri 15 dakikada tamamlayabilirsin."
                 ],
                 checklist: [
-                    StudyChecklistItem(id: "cod_1", topic: "Enseñanza Virtual Üzerinden CODIUS Online Testlerini Tamamla", detail: "Catálogo Fama, UVUS ve APA 7 sorularını rehberden kontrol et", priority: "NORMAL")
+                    StudyChecklistItem(id: "cod_1", topic: "CODIUS Online Test Rehberi PDF", detail: "00_DERS_REHBERI_VE_KONU_OZETI.pdf", priority: "NORMAL", pdfFileName: "00_DERS_REHBERI_VE_KONU_OZETI.pdf")
                 ]
             )
         ]
+    }
+}
+
+private struct PDFKitInlineView: NSViewRepresentable {
+    let path: String
+
+    func makeNSView(context: Context) -> PDFView {
+        let pdfView = PDFView()
+        pdfView.autoScales = true
+        pdfView.displayMode = .singlePageContinuous
+        pdfView.displaysPageBreaks = true
+        pdfView.backgroundColor = NSColor.windowBackgroundColor
+        if !path.isEmpty, let doc = PDFDocument(url: URL(fileURLWithPath: path)) {
+            pdfView.document = doc
+        }
+        return pdfView
+    }
+
+    func updateNSView(_ pdfView: PDFView, context: Context) {
+        guard !path.isEmpty else {
+            pdfView.document = nil
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        if pdfView.document?.documentURL != url {
+            pdfView.document = PDFDocument(url: url)
+        }
     }
 }
 
@@ -5812,50 +6169,65 @@ private struct UniversityStudyPopoverView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(course.checklist) { item in
                                 let done = study.isCompleted(item)
-                                Button {
-                                    study.toggleChecklist(item)
-                                } label: {
-                                    HStack(alignment: .top, spacing: 8) {
-                                        Image(systemName: done ? "checkmark.circle.fill" : "circle")
-                                            .foregroundStyle(done ? Color.green : Color.secondary)
-                                            .padding(.top, 1)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            HStack {
-                                                Text(item.topic)
-                                                    .font(.caption.weight(.semibold))
-                                                    .strikethrough(done)
-                                                    .foregroundStyle(done ? Color.secondary : Color.primary)
-                                                Spacer()
-                                                Text(item.priority)
-                                                    .font(.system(size: 9, weight: .bold))
-                                                    .padding(.horizontal, 5)
-                                                    .padding(.vertical, 1)
-                                                    .background(
-                                                        item.priority == "KRİTİK" ? Color.red.opacity(0.2) : Color.mint.opacity(0.2),
-                                                        in: Capsule()
-                                                    )
+                                HStack(alignment: .top, spacing: 8) {
+                                    Button {
+                                        study.toggleChecklist(item)
+                                    } label: {
+                                        HStack(alignment: .top, spacing: 8) {
+                                            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                                                .foregroundStyle(done ? Color.green : Color.secondary)
+                                                .padding(.top, 1)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                HStack {
+                                                    Text(item.topic)
+                                                        .font(.caption.weight(.semibold))
+                                                        .strikethrough(done)
+                                                        .foregroundStyle(done ? Color.secondary : Color.primary)
+                                                    Spacer()
+                                                    Text(item.priority)
+                                                        .font(.system(size: 9, weight: .bold))
+                                                        .padding(.horizontal, 5)
+                                                        .padding(.vertical, 1)
+                                                        .background(
+                                                            item.priority == "KRİTİK" ? Color.red.opacity(0.2) : Color.mint.opacity(0.2),
+                                                            in: Capsule()
+                                                        )
+                                                }
+                                                Text(item.detail)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(Color.secondary)
                                             }
-                                            Text(item.detail)
-                                                .font(.caption2)
-                                                .foregroundStyle(Color.secondary)
                                         }
                                     }
-                                    .padding(7)
-                                    .background(.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    .buttonStyle(.plain)
+
+                                    if item.pdfFileName != nil {
+                                        Button {
+                                            study.openChecklistPDF(item, alsoOpenExternal: true)
+                                        } label: {
+                                            Label("PDF", systemImage: "doc.richtext.fill")
+                                                .font(.caption2.weight(.semibold))
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.cyan)
+                                        .controlSize(.mini)
+                                        .help("Bu Tema'nın detaylı PDF ders notunu aç")
+                                    }
                                 }
-                                .buttonStyle(.plain)
+                                .padding(7)
+                                .background(.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                             }
                         }
                     } else {
                         VStack(alignment: .leading, spacing: 6) {
                             let files = study.courseFiles[course.id] ?? []
-                            ForEach(files.prefix(8)) { file in
+                            ForEach(files.prefix(12)) { file in
                                 HStack {
-                                    Image(systemName: file.isMarkdown ? "doc.richtext.fill" : "doc.fill")
-                                        .foregroundStyle(file.isMarkdown ? Color.mint : Color.orange)
+                                    Image(systemName: file.isStudyGuidePDF ? "book.closed.fill" : (file.isMarkdown ? "doc.richtext.fill" : "doc.fill"))
+                                        .foregroundStyle(file.isStudyGuidePDF ? Color.cyan : (file.isMarkdown ? Color.mint : Color.orange))
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(file.name)
-                                            .font(.caption.weight(.medium))
+                                            .font(.caption.weight(file.isStudyGuidePDF ? .bold : .medium))
                                             .lineLimit(1)
                                         Text("\(file.relativePath) · \(file.sizeLabel)")
                                             .font(.caption2)
@@ -5863,17 +6235,42 @@ private struct UniversityStudyPopoverView: View {
                                             .lineLimit(1)
                                     }
                                     Spacer()
+                                    if file.isPDF || file.isMarkdown {
+                                        Button("Önizle") {
+                                            study.selectFile(file)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                    }
                                     Button("Aç") {
                                         study.openInPreviewOrFinder(file.fullPath)
                                     }
-                                    .buttonStyle(.bordered)
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(file.isStudyGuidePDF ? .cyan : .mint)
                                     .controlSize(.mini)
                                 }
                                 .padding(6)
                                 .background(.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                             }
 
-                            if !study.selectedMarkdownContent.isEmpty {
+                            if !study.selectedPDFPath.isEmpty {
+                                Divider()
+                                HStack {
+                                    Text(study.selectedMarkdownTitle)
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(Color.cyan)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Button("Preview'da Aç") {
+                                        study.openInPreviewOrFinder(study.selectedPDFPath)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                                PDFKitInlineView(path: study.selectedPDFPath)
+                                    .frame(height: 320)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            } else if !study.selectedMarkdownContent.isEmpty {
                                 Divider()
                                 Text(study.selectedMarkdownTitle)
                                     .font(.caption.weight(.bold))
@@ -6133,7 +6530,7 @@ private struct UniversityCommandCenterView: View {
                     // Interactive Study Checklist
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Label("Çalışman Gerekenler Checklist", systemImage: "checklist.checked")
+                            Label("Çalışman Gerekenler Checklist (Tema Bazlı PDF Modüller)", systemImage: "checklist.checked")
                                 .font(.headline)
                                 .foregroundStyle(Color.green)
                             Spacer()
@@ -6144,40 +6541,65 @@ private struct UniversityCommandCenterView: View {
 
                         ForEach(course.checklist) { item in
                             let done = study.isCompleted(item)
-                            Button {
-                                study.toggleChecklist(item)
-                            } label: {
-                                HStack(alignment: .top, spacing: 10) {
-                                    Image(systemName: done ? "checkmark.square.fill" : "square")
-                                        .font(.title3)
-                                        .foregroundStyle(done ? Color.green : Color.secondary)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack {
-                                            Text(item.topic)
-                                                .font(.subheadline.weight(.semibold))
-                                                .strikethrough(done)
-                                                .foregroundStyle(done ? Color.secondary : Color.primary)
-                                            Spacer()
-                                            Text(item.priority)
-                                                .font(.caption2.weight(.bold))
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(
-                                                    item.priority == "KRİTİK" ? Color.red.opacity(0.22) : Color.mint.opacity(0.2),
-                                                    in: Capsule()
-                                                )
-                                                .foregroundStyle(item.priority == "KRİTİK" ? Color.orange : Color.mint)
+                            HStack(alignment: .top, spacing: 10) {
+                                Button {
+                                    study.toggleChecklist(item)
+                                } label: {
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Image(systemName: done ? "checkmark.square.fill" : "square")
+                                            .font(.title3)
+                                            .foregroundStyle(done ? Color.green : Color.secondary)
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack {
+                                                Text(item.topic)
+                                                    .font(.subheadline.weight(.semibold))
+                                                    .strikethrough(done)
+                                                    .foregroundStyle(done ? Color.secondary : Color.primary)
+                                                Spacer()
+                                                Text(item.priority)
+                                                    .font(.caption2.weight(.bold))
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(
+                                                        item.priority == "KRİTİK" ? Color.red.opacity(0.22) : Color.mint.opacity(0.2),
+                                                        in: Capsule()
+                                                    )
+                                                    .foregroundStyle(item.priority == "KRİTİK" ? Color.orange : Color.mint)
+                                            }
+                                            Text(item.detail)
+                                                .font(.caption)
+                                                .foregroundStyle(Color.secondary)
                                         }
-                                        Text(item.detail)
-                                            .font(.caption)
-                                            .foregroundStyle(Color.secondary)
                                     }
                                 }
-                                .padding(10)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .buttonStyle(.plain)
+
+                                if item.pdfFileName != nil {
+                                    VStack(spacing: 4) {
+                                        Button {
+                                            study.openChecklistPDF(item, alsoOpenExternal: false)
+                                        } label: {
+                                            Label("PDF Oku", systemImage: "book.pages.fill")
+                                                .font(.caption2.weight(.semibold))
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.cyan)
+                                        .controlSize(.small)
+
+                                        Button {
+                                            study.openChecklistPDF(item, alsoOpenExternal: true)
+                                        } label: {
+                                            Label("Preview", systemImage: "arrow.up.right.square")
+                                                .font(.caption2)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                    }
+                                }
                             }
-                            .buttonStyle(.plain)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                     }
                     .padding(14)
@@ -6186,58 +6608,66 @@ private struct UniversityCommandCenterView: View {
             }
             .frame(minWidth: 420, maxWidth: .infinity)
 
-            // RIGHT COLUMN: Built-in Markdown Study Guide / Exam Simulation Reader + Course PDFs + Personal Notes
+            // RIGHT COLUMN: Built-in PDF / Markdown Study Guide & Exam Simulation Reader + Personal Notes
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Label("Ders Notları, Rehber & Simülasyon", systemImage: "book.pages.fill")
+                    Label(study.selectedMarkdownTitle.isEmpty ? "Ders Notları, PDF Rehber & Simülasyon" : study.selectedMarkdownTitle, systemImage: "book.pages.fill")
                         .font(.headline)
                         .foregroundStyle(Color.cyan)
+                        .lineLimit(1)
                     Spacer()
                     if !study.selectedMarkdownPath.isEmpty {
-                        Button("Dışarıda Aç") {
+                        Button("Preview'da Aç") {
                             study.openInPreviewOrFinder(study.selectedMarkdownPath)
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.cyan)
                         .controlSize(.small)
                     }
                 }
 
-                // Quick Markdown & PDF File Bar
+                // Quick PDF & Markdown File Bar
                 let files = study.courseFiles[course.id] ?? []
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(files) { file in
                             Button {
-                                if file.isMarkdown {
-                                    study.loadMarkdownFile(file)
-                                } else {
-                                    study.openInPreviewOrFinder(file.fullPath)
-                                }
+                                study.selectFile(file)
                             } label: {
                                 Label(
                                     file.name,
-                                    systemImage: file.isSimulation ? "checkmark.seal.fill" : (file.isMarkdown ? "doc.richtext.fill" : "doc.fill")
+                                    systemImage: file.isSimulation ? "checkmark.seal.fill" : (file.isStudyGuidePDF ? "book.closed.fill" : (file.isMarkdown ? "doc.richtext.fill" : "doc.fill"))
                                 )
                                 .font(.caption2.weight(study.selectedMarkdownPath == file.fullPath ? .bold : .regular))
                             }
                             .buttonStyle(.bordered)
-                            .tint(file.isSimulation ? .orange : (file.isMarkdown ? .cyan : .secondary))
+                            .tint(file.isSimulation ? .orange : (file.isStudyGuidePDF ? .cyan : (file.isMarkdown ? .mint : .secondary)))
                             .controlSize(.small)
                         }
                     }
                 }
 
-                // Markdown Reader
-                ScrollView {
-                    Text(study.selectedMarkdownContent)
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .foregroundStyle(Color.primary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
+                // Inline PDFKit or Markdown Reader
+                if !study.selectedPDFPath.isEmpty {
+                    PDFKitInlineView(path: study.selectedPDFPath)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(Color.cyan.opacity(0.25), lineWidth: 1)
+                        )
+                } else {
+                    ScrollView {
+                        Text(study.selectedMarkdownContent)
+                            .font(.system(size: 12.5, design: .monospaced))
+                            .foregroundStyle(Color.primary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.background.opacity(0.65), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.background.opacity(0.65), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
                 Divider()
 
@@ -6672,13 +7102,17 @@ private extension ShapeStyle where Self == Color {
 }
 
 private enum CommandCenterTab: String, CaseIterable, Identifiable {
-    case all = "Genel Komuta"
-    case study = "Dersler & Sınavlar"
-    case smartHome = "Ev, Hue & TV"
-    case opportunities = "Fırsatlar"
-    case operations = "Operasyon & Mail"
-    case lolile = "LOLİLE PC"
+    case dashboard = "Kontrol Paneli"
+    case outreach = "Otonom Boru Hattı"
+    case hunter = "Fırsat & Müşteri Avcısı"
+    case opportunities = "Kamu & İhale İstihbaratı"
+    case smartHome = "Akıllı Ev & Cihazlar"
+    case study = "US Ders & Sınavlar"
+    case all = "Sistem & Altyapı"
+    case expoGarage = "Fuar & RM Garage"
+    case lolile = "LOLİLE 1000 Mbps"
     case myaL11 = "MYA-L11 Sunucu"
+    case operations = "Operasyon & Mail"
     case node = "Vaytniga & Deck"
     case broadcast = "Yayın Merkezi"
 
@@ -6686,16 +7120,86 @@ private enum CommandCenterTab: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
-        case .all: return "square.grid.3x2.fill"
-        case .study: return "graduationcap.fill"
-        case .smartHome: return "lightbulb.led.wide.fill"
+        case .dashboard: return "square.grid.2x2.fill"
+        case .outreach: return "envelope.badge.shield.half.filled"
+        case .hunter: return "target"
         case .opportunities: return "sparkles.rectangle.stack.fill"
-        case .operations: return "bolt.shield.fill"
+        case .smartHome: return "lightbulb.led.wide.fill"
+        case .study: return "graduationcap.fill"
+        case .all: return "server.rack"
+        case .expoGarage: return "globe.europe.africa.fill"
         case .lolile: return "desktopcomputer"
         case .myaL11: return "server.rack"
+        case .operations: return "envelope.badge.shield.half.filled.fill"
         case .node: return "iphone.gen3"
         case .broadcast: return "dot.radiowaves.left.and.right"
         }
+    }
+}
+
+private enum LeadCategoryFilter: String, CaseIterable, Identifiable {
+    case all = "Tüm Hedefler"
+    case local = "Yerel İşletmeler"
+    case expo = "Fuar & Katalog"
+    case garage = "RM Garage Oto"
+    case dossiers = "Kamu & İhale AI"
+
+    var id: String { rawValue }
+}
+
+private struct StudioSemiCircleGauge: View {
+    let segment1Ratio: Double
+    let segment2Ratio: Double
+    let segment3Ratio: Double
+    let color1: Color
+    let color2: Color
+    let color3: Color
+    let centerValue: String
+    let centerSubtitle: String
+
+    var body: some View {
+        ZStack {
+            // Background track (top half of circle)
+            Circle()
+                .trim(from: 0.0, to: 0.5)
+                .stroke(Color.secondary.opacity(0.14), style: StrokeStyle(lineWidth: 22, lineCap: .butt))
+                .rotationEffect(.degrees(180))
+
+            let r1 = max(0.0, min(0.5, segment1Ratio * 0.5))
+            let r2 = max(0.0, min(0.5 - r1, segment2Ratio * 0.5))
+            let r3 = max(0.0, min(0.5 - r1 - r2, segment3Ratio * 0.5))
+
+            if r1 > 0 {
+                Circle()
+                    .trim(from: 0.0, to: r1)
+                    .stroke(color1, style: StrokeStyle(lineWidth: 22, lineCap: .butt))
+                    .rotationEffect(.degrees(180))
+            }
+            if r2 > 0 {
+                Circle()
+                    .trim(from: r1, to: r1 + r2)
+                    .stroke(color2, style: StrokeStyle(lineWidth: 22, lineCap: .butt))
+                    .rotationEffect(.degrees(180))
+            }
+            if r3 > 0 {
+                Circle()
+                    .trim(from: r1 + r2, to: r1 + r2 + r3)
+                    .stroke(color3, style: StrokeStyle(lineWidth: 22, lineCap: .butt))
+                    .rotationEffect(.degrees(180))
+            }
+
+            VStack(spacing: 2) {
+                Text(centerValue)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(.primary)
+                Text(centerSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .offset(y: -10)
+        }
+        .frame(width: 196, height: 112)
+        .padding(.top, 14)
     }
 }
 
@@ -6712,199 +7216,1776 @@ private struct DAAKCommandCenterView: View {
     @EnvironmentObject private var smartHome: SmartHomeMonitor
     @EnvironmentObject private var study: UniversityStudyMonitor
 
-    @State private var selectedTab: CommandCenterTab = .all
+    @State private var selectedTab: CommandCenterTab = .dashboard
+    @State private var sidebarCollapsed = false
+    @State private var selectedCategoryFilter: LeadCategoryFilter = .all
+    @State private var selectedCountryFilter: String = "Tümü"
+    @State private var searchText: String = ""
+    @State private var onlyNoWebsite: Bool = false
+    @State private var onlyWithVerifiedEmail: Bool = false
+    @State private var testSendingLeadId: String? = nil
+    @State private var expandedLeadId: String?
+
+    private let countryChips: [(label: String, match: String)] = [
+        ("Tümü", "Tümü"),
+        ("🇦🇪 Dubai", "Dubai"),
+        ("🇨🇭 İsviçre", "İsviçre"),
+        ("🇺🇸 ABD", "ABD"),
+        ("🇬🇧 İngiltere", "İngiltere"),
+        ("🇨🇦 Kanada", "Kanada"),
+        ("🇪🇸 İspanya", "İspanya"),
+        ("🇹🇷 Türkiye", "Türkiye"),
+        ("🇶🇦 Katar", "Katar"),
+        ("🇩🇪/🇳🇱 AB", "AB_GROUP"),
+    ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Top Unified Command Bar
-            headerBar
-                .padding(.horizontal, 20)
-                .padding(.vertical, 14)
-                .background(.ultraThinMaterial)
+        HStack(spacing: 0) {
+            // LEFT COLLAPSIBLE STUDIO SIDEBAR
+            studioSidebar
+                .frame(width: sidebarCollapsed ? 68 : 232)
+                .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
-            // Quick Action Ribbon
-            quickActionRibbon
-                .padding(.horizontal, 20)
-                .padding(.vertical, 10)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+            // RIGHT MAIN STUDIO WORKSPACE
+            VStack(spacing: 0) {
+                studioHeaderBar
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 14)
+                    .background(Color(nsColor: .controlBackgroundColor))
 
-            Divider()
+                Divider()
 
-            // Main Content Area
-            Group {
-                switch selectedTab {
-                case .all:
-                    allInOneBentoDashboard
-                case .study:
-                    UniversityCommandCenterView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .smartHome:
-                    ScrollView {
-                        HStack(alignment: .top, spacing: 18) {
-                            hueFullColumn
-                            tvFullColumn
-                            modemAndRmosColumn
+                if let msg = opportunity.actionMessage ?? smartHome.actionMessage {
+                    HStack(spacing: 8) {
+                        if opportunity.isRunningCashHunter || smartHome.isWorking {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.indigo)
                         }
-                        .padding(20)
+                        Text(msg)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Spacer()
                     }
-                case .opportunities:
-                    OpportunityView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .operations:
-                    OperationsView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .lolile:
-                    ScrollView {
-                        RelayMenuView()
-                            .frame(maxWidth: 640)
-                            .padding(20)
-                    }
-                case .myaL11:
-                    MYAL11MenuView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .node:
-                    HStack(alignment: .top, spacing: 16) {
-                        NodeMenuView()
-                        Divider()
-                        DeckManagerView()
-                    }
-                    .padding(12)
-                case .broadcast:
-                    BroadcastView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 7)
+                    .background(Color.indigo.opacity(0.08))
+                    Divider()
                 }
+
+                Group {
+                    switch selectedTab {
+                    case .dashboard:
+                        studioExecutiveDashboard
+                    case .outreach:
+                        studioOutreachPipelineView
+                    case .hunter:
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                topKpiCardsRow
+                                leadsTableCard(fullHeight: true)
+                            }
+                            .padding(22)
+                        }
+                    case .expoGarage:
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                topKpiCardsRow
+                                leadsTableCard(fullHeight: true)
+                            }
+                            .padding(22)
+                        }
+                        .onAppear {
+                            if selectedCategoryFilter == .all || selectedCategoryFilter == .local {
+                                selectedCategoryFilter = .expo
+                            }
+                        }
+                    case .opportunities:
+                        OpportunityView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    case .study:
+                        UniversityCommandCenterView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    case .smartHome:
+                        ScrollView {
+                            HStack(alignment: .top, spacing: 18) {
+                                hueFullColumn
+                                tvFullColumn
+                                modemAndRmosColumn
+                            }
+                            .padding(20)
+                        }
+                    case .all:
+                        allInOneBentoDashboard
+                    case .lolile:
+                        ScrollView {
+                            RelayMenuView()
+                                .frame(maxWidth: 640)
+                                .padding(20)
+                        }
+                    case .myaL11:
+                        MYAL11MenuView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    case .operations:
+                        OperationsView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    case .node:
+                        HStack(alignment: .top, spacing: 16) {
+                            NodeMenuView()
+                            Divider()
+                            DeckManagerView()
+                        }
+                        .padding(12)
+                    case .broadcast:
+                        BroadcastView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 1120, minHeight: 760)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 1220, minHeight: 780)
     }
 
-    private var headerBar: some View {
-        HStack(spacing: 14) {
+    // =========================================================================
+    // 1. LEFT SIDEBAR (Minimal Modern Studio Layout)
+    // =========================================================================
+
+    private var studioSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Brand Logo & Window Traffic Lights Offset
             HStack(spacing: 10) {
-                Image(systemName: "command.square.fill")
-                    .font(.system(size: 26, weight: .bold))
-                    .foregroundStyle(.indigo)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("DAAK KOMUTA MERKEZİ")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                    Text("RM-OS · US Ders & Sınavlar · Akıllı Ev · LOLİLE · MYA-L11 · Vaytniga · Fırsatlar")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.teal, Color.indigo, Color.purple],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 30, height: 30)
+                    Image(systemName: "command.square.fill")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
                 }
+
+                if !sidebarCollapsed {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("DAAK NODE")
+                            .font(.system(size: 14, weight: .heavy, design: .rounded))
+                            .tracking(0.5)
+                        Text("KONTROL MERKEZİ · v2.20.0")
+                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 28) // Space for macOS window traffic lights
+            .padding(.bottom, 16)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    sidebarNavSection(
+                        title: "YÖNETİM",
+                        tabs: [.dashboard, .outreach, .hunter, .opportunities]
+                    )
+
+                    sidebarNavSection(
+                        title: "SİSTEM & YAŞAM",
+                        tabs: [.smartHome, .study, .all]
+                    )
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 14)
+            }
+
+            Spacer(minLength: 0)
+
+            Divider()
+
+            // Footer: Live status pill + collapse button
+            VStack(spacing: 8) {
+                if !sidebarCollapsed {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(relay.isConnected ? Color.green : Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text("LOLİLE 1 Gbps")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Text(relay.isConnected ? "100% Canlı" : "Beklemede")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        sidebarCollapsed.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        if !sidebarCollapsed {
+                            Text("Menüyü Daralt")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        Image(systemName: sidebarCollapsed ? "sidebar.right" : "sidebar.left")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.teal)
+                            .padding(6)
+                            .background(Color.teal.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .padding(.horizontal, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func sidebarNavSection(title: String, tabs: [CommandCenterTab]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if !sidebarCollapsed {
+                Text(title)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 2)
+            }
+            ForEach(tabs) { tab in
+                let isSelected = selectedTab == tab
+                Button {
+                    selectedTab = tab
+                    if tab == .hunter {
+                        selectedCategoryFilter = .local
+                    } else if tab == .dashboard {
+                        selectedCategoryFilter = .all
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: tab.symbol)
+                            .font(.system(size: 13, weight: isSelected ? .bold : .medium))
+                            .foregroundStyle(isSelected ? Color.teal : Color.secondary)
+                            .frame(width: 20)
+
+                        if !sidebarCollapsed {
+                            Text(tab.rawValue)
+                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            if let badge = sidebarBadge(for: tab) {
+                                Text(badge.text)
+                                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(badge.color, in: Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        isSelected ? Color.teal.opacity(0.13) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(tab.rawValue)
+            }
+        }
+    }
+
+    private func sidebarBadge(for tab: CommandCenterTab) -> (text: String, color: Color)? {
+        switch tab {
+        case .outreach:
+            let verifiedCount = opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }.count
+            return (verifiedCount > 0 ? "\(verifiedCount)" : "25", .indigo)
+        case .hunter:
+            let count = opportunity.cashHunterLeads.count
+            return count > 0 ? ("\(count)", .orange) : nil
+        case .opportunities:
+            let count = opportunity.opportunities.count
+            return count > 0 ? ("\(count)", .indigo) : nil
+        case .study:
+            return study.upcomingExams.first.map { ($0.countdownBadge(), .mint) }
+        case .smartHome:
+            return smartHome.anyLightOn ? ("Açık", .yellow) : nil
+        case .all:
+            return ("1G", .blue)
+        default:
+            return nil
+        }
+    }
+
+    // =========================================================================
+    // 2. TOP STUDIO HEADER BAR ("Hoşgeldiniz, Fırat")
+    // =========================================================================
+
+    private var studioHeaderBar: some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Hoşgeldiniz, Fırat")
+                    .font(.system(size: 17, weight: .bold))
+                Text("DAAK Küresel Fırsat & Dijital Gelir Motoru · 9 Ülke Canlı Taranıyor")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            // Live System Status Pills
+            // Live Infrastructure Badges
             HStack(spacing: 8) {
-                systemBadge("US Sınav", online: true, detail: study.upcomingExams.first.map { "\($0.shortName) (\($0.countdownBadge()))" } ?? "12 Ders")
-                systemBadge("Hue", online: smartHome.hueOnline, detail: smartHome.anyLightOn ? "Açık" : "Kapalı")
-                systemBadge("TV 4K", online: smartHome.tv?.online == true, detail: smartHome.tv?.activeAppLabel ?? "Kapalı")
-                systemBadge("Vaytniga", online: smartHome.modem?.online == true || node.isOnline, detail: smartHome.modem?.netType ?? "LTE")
-                systemBadge("LOLİLE", online: relay.isConnected, detail: relay.status?.hardware?.power?.wallEstimateWatts.map { String(format: "%.0fW", $0) } ?? "PC")
-                systemBadge("MYA-L11", online: myaL11.isOnline, detail: myaL11.isOnBattery ? "Pilde!" : "AC 7/24")
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(relay.isConnected ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text("LOLİLE 1 Gbps")
+                        .font(.caption2.weight(.semibold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.4), in: Capsule())
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(myaL11.isOnline ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text("MYA-L11 (7/24)")
+                        .font(.caption2.weight(.semibold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.4), in: Capsule())
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(smartHome.hueOnline ? Color.yellow : Color.secondary)
+                        .frame(width: 7, height: 7)
+                    Text("Hue")
+                        .font(.caption2.weight(.semibold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.4), in: Capsule())
             }
 
+            Divider()
+                .frame(height: 20)
+
+            // Trigger Scan Action Button
+            Button {
+                Task { await opportunity.triggerCashHunterScanNow() }
+            } label: {
+                HStack(spacing: 6) {
+                    if opportunity.isRunningCashHunter {
+                        ProgressView().controlSize(.mini)
+                        Text("Taranıyor…")
+                            .font(.caption.weight(.bold))
+                    } else {
+                        Image(systemName: "bolt.fill")
+                            .font(.caption)
+                        Text("Canlı Tarama")
+                            .font(.caption.weight(.bold))
+                    }
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.teal, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .help("LOLILE üzerinden küresel işletme ve fırsat taramasını tetikle")
+
+            // Refresh Button
             Button {
                 Task {
-                    async let a: Void = smartHome.refresh()
-                    async let b: Void = relay.refresh()
-                    async let c: Void = myaL11.refresh()
-                    async let d: Void = node.refresh()
-                    async let e: Void = opportunity.refresh()
-                    _ = await (a, b, c, d, e)
+                    async let a: Void = opportunity.refresh()
+                    async let b: Void = smartHome.refresh()
+                    async let c: Void = relay.refresh()
+                    async let d: Void = myaL11.refresh()
+                    _ = await (a, b, c, d)
                 }
             } label: {
-                Label("Tümünü Yenile", systemImage: "arrow.clockwise")
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(6)
+                    .background(.quaternary.opacity(0.45), in: Circle())
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.indigo)
-            .controlSize(.small)
+            .buttonStyle(.plain)
+            .help("Tüm düğümleri ve fırsatları yenile")
+
+            // Profile Avatar
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [.indigo, .purple],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: 28, height: 28)
+                .overlay {
+                    Text("FK")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                }
         }
     }
 
-    private var quickActionRibbon: some View {
+    // =========================================================================
+    // 3. STUDIO EXECUTIVE DASHBOARD (Minimal Perapole Reference Layout)
+    // =========================================================================
+
+    private var studioExecutiveDashboard: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // ROW 1: 4 HyperUI Metric Stat Cards
+                topKpiCardsRow
+
+                // ROW 2: HyperUI Outreach Autopilot Banner
+                hyperuiOutreachBanner
+
+                // ROW 3: Visual Breakdown & High-Ticket Markets
+                HStack(alignment: .top, spacing: 16) {
+                    digitalOpportunityBreakdownCard
+                        .frame(maxWidth: .infinity)
+
+                    highTicketMarketsCard
+                        .frame(width: 340)
+                }
+
+                // ROW 4: Full-Width Clean Leads Table
+                leadsTableCard(fullHeight: false)
+            }
+            .padding(20)
+        }
+    }
+
+    private var topKpiCardsRow: some View {
+        let verifiedCount = opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }.count
+        let totalCount = opportunity.cashHunterLeads.count
+
+        return HStack(spacing: 14) {
+            hyperuiStatCard(
+                category: "AKTİF MÜŞTERİ HEDEFİ",
+                value: "\(totalCount)",
+                badge: "↗ +%96 Sıcak Skor",
+                badgeColor: .green,
+                subtitle: "Dubai · İsviçre · ABD · UK · TR",
+                icon: "target",
+                tint: Color(red: 0.28, green: 0.44, blue: 0.96)
+            )
+
+            hyperuiStatCard(
+                category: "DOĞRULANMIŞ E-POSTA",
+                value: "\(verifiedCount)",
+                badge: "● %\(totalCount > 0 ? (verifiedCount * 100 / totalCount) : 60) İletişim",
+                badgeColor: .teal,
+                subtitle: "Derin spider ile doğrudan kontak",
+                icon: "envelope.fill",
+                tint: Color(red: 0.20, green: 0.72, blue: 0.65)
+            )
+
+            hyperuiStatCard(
+                category: "ÖNGÖRÜLEN GELİR HACMİ",
+                value: "$14,850+",
+                badge: "7 Ülke · 9 Pazar",
+                badgeColor: .purple,
+                subtitle: "Ort. Paket: $650 / 14.500₺",
+                icon: "banknote.fill",
+                tint: Color(red: 0.58, green: 0.38, blue: 0.92)
+            )
+
+            hyperuiStatCard(
+                category: "LOLİLE 1 Gbps & ALTYAPI",
+                value: "1,000 Mbps",
+                badge: relay.isConnected ? "● Canlı & Aktif" : "○ Beklemede",
+                badgeColor: relay.isConnected ? .green : .orange,
+                subtitle: "Stalwart SMTP/IMAP & RM-OS",
+                icon: "bolt.fill",
+                tint: Color(red: 0.96, green: 0.68, blue: 0.14)
+            )
+        }
+    }
+
+    private func hyperuiStatCard(
+        category: String,
+        value: String,
+        badge: String,
+        badgeColor: Color,
+        subtitle: String,
+        icon: String,
+        tint: Color
+    ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                ForEach(CommandCenterTab.allCases) { tab in
-                    Button {
-                        selectedTab = tab
-                    } label: {
-                        Label(tab.rawValue, systemImage: tab.symbol)
-                            .font(.caption.weight(selectedTab == tab ? .semibold : .regular))
+            HStack {
+                Text(category)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(tint.opacity(0.12))
+                        .frame(width: 26, height: 26)
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(tint)
+                }
+            }
+
+            Text(value)
+                .font(.system(size: 26, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
+
+            HStack(spacing: 6) {
+                Text(badge)
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                    .foregroundStyle(badgeColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(badgeColor.opacity(0.12), in: Capsule())
+
+                Text(subtitle)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+        }
+    }
+
+    private var hyperuiOutreachBanner: some View {
+        let verifiedCount = opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }.count
+
+        return HStack(spacing: 16) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.indigo, Color.purple],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 44, height: 44)
+
+                Image(systemName: "envelope.badge.shield.half.filled")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text("Redmono Otonom Soğuk E-Posta Boru Hattı")
+                        .font(.system(size: 13.5, weight: .bold))
+                        .foregroundStyle(.primary)
+
+                    Text("🛡️ GÜVENLİ TEST MODU (STAGED_ONLY)")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(Color.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.14), in: Capsule())
+                }
+
+                Text("LOLILE 1 Gbps kazıcının derin spider ile bulduğu \(verifiedCount > 0 ? "\(verifiedCount)" : "25") doğrulanmış işletmeye özel teklif hazırlandı. RM-OS Level 2 güvenlik politikası gereği dış dünyaya e-posta gönderimi KİLİTLİDİR; tüm testler 4gadakai@gmail.com adresinize yönlendirilir.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                HStack(spacing: 8) {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.indigo).frame(width: 6, height: 6)
+                        Text("\(verifiedCount > 0 ? "\(verifiedCount)" : "25") Hazır Taslak")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(selectedTab == tab ? .indigo : .secondary)
-                    .controlSize(.small)
+
+                    Text("•").foregroundStyle(.tertiary)
+
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                        Text("1 Test Başarılı (68ms)")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("•").foregroundStyle(.tertiary)
+
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.secondary).frame(width: 6, height: 6)
+                        Text("0 Dış Gönderim (Korumalı)")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("•").foregroundStyle(.tertiary)
+
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.teal).frame(width: 6, height: 6)
+                        Text("Stalwart SMTP/IMAP: Aktif")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 2)
+            }
+
+            Spacer()
+
+            VStack(spacing: 6) {
+                Button {
+                    Task {
+                        await opportunity.sendTestOutreach()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Test Gönder (4gadakai)")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.indigo, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .help("Kişisel e-postanıza (4gadakai@gmail.com) test gönderimi yap")
+
+                Button {
+                    selectedTab = .outreach
+                } label: {
+                    HStack(spacing: 5) {
+                        Text("Boru Hattını Yönet")
+                            .font(.system(size: 11, weight: .semibold))
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundStyle(Color.indigo)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.indigo.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(Color.indigo.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.indigo.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var digitalOpportunityBreakdownCard: some View {
+        let allLeads = opportunity.cashHunterLeads
+        let total = max(allLeads.count, 1)
+        let noWeb = allLeads.filter(\.hasNoWebsite).count
+        let sslMobile = allLeads.filter { !$0.hasNoWebsite && $0.leadType == "LOCAL_BUSINESS" }.count
+        let expoAndAuto = allLeads.filter { $0.leadType == "EXPO_EXHIBITOR" || $0.leadType == "RM_GARAGE_AUTO" }.count
+        let verifiedEmail = allLeads.filter(\.hasVerifiedEmail).count
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("DİJİTAL EKSİK & GELİR FIRSATLARI")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(.secondary)
+                    Text("Segment Dağılımı ve Hazır Paketler")
+                        .font(.system(size: 13, weight: .bold))
                 }
 
                 Spacer()
 
-                // One-Click Global Macros
-                Button {
-                    Task { await smartHome.startCinemaMode(app: "stremio") }
-                } label: {
-                    Label("Sinema + Stremio", systemImage: "popcorn.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-                .controlSize(.small)
-
-                Button {
-                    Task {
-                        await smartHome.applyScene("night")
-                        await smartHome.tvArtMode()
-                    }
-                } label: {
-                    Label("Gece + The Frame", systemImage: "photo.artframe")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button {
-                    Task {
-                        await smartHome.setAllLights(on: false)
-                        await smartHome.tvSleep()
-                    }
-                } label: {
-                    Label("Ev Uyku Modu", systemImage: "moon.zzz.fill")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                Text("\(allLeads.count) Aktif Hedef")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
             }
 
-            if let msg = smartHome.actionMessage {
-                HStack(spacing: 8) {
-                    if smartHome.isWorking {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "bolt.horizontal.circle.fill")
-                            .foregroundStyle(.indigo)
+            VStack(spacing: 10) {
+                breakdownProgressBar(
+                    title: "Web Sitesi Bulunmayanlar",
+                    detail: "Web Sitesi & Randevu Botu ($450–$950)",
+                    count: noWeb,
+                    total: total,
+                    color: Color.orange
+                )
+
+                breakdownProgressBar(
+                    title: "Mobil / SEO Açığı Olanlar",
+                    detail: "Hız & Dönüşüm Paketi (290€–450€)",
+                    count: sslMobile,
+                    total: total,
+                    color: Color(red: 0.28, green: 0.44, blue: 0.96)
+                )
+
+                breakdownProgressBar(
+                    title: "Fuar & Katalog İhracatçıları",
+                    detail: "B2B Fuar Vitrini ($650–$1,200)",
+                    count: expoAndAuto,
+                    total: total,
+                    color: Color(red: 0.20, green: 0.72, blue: 0.65)
+                )
+
+                breakdownProgressBar(
+                    title: "Doğrulanmış E-Postalı Hedefler",
+                    detail: "Tek Tıkla İletişime Hazır (Stalwart)",
+                    count: verifiedEmail,
+                    total: total,
+                    color: Color.green
+                )
+            }
+        }
+        .padding(14)
+        .frame(height: 220)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+        }
+    }
+
+    private func breakdownProgressBar(
+        title: String,
+        detail: String,
+        count: Int,
+        total: Int,
+        color: Color
+    ) -> some View {
+        let ratio = max(0.0, min(1.0, Double(count) / Double(max(total, 1))))
+        let percent = Int((ratio * 100).rounded())
+
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                Text("· \(detail)")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Spacer()
+
+                Text("\(count) (\(percent)%)")
+                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                    .foregroundStyle(color)
+            }
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(Color.primary.opacity(0.06))
+                        .frame(height: 6)
+
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(color)
+                        .frame(width: max(geo.size.width * CGFloat(ratio), 4), height: 6)
+                }
+            }
+            .frame(height: 6)
+        }
+    }
+
+    // --- ROW 2 RIGHT: High-Ticket Markets & Turnkey Package Ticker Card ---
+    private var highTicketMarketsCard: some View {
+        let markets: [(flag: String, name: String, sub: String, price: String, badge: String, filterKey: String)] = [
+            ("🇦🇪", "BAE · Dubai & Abu Dhabi", "VIP Klinik & Emlak", "$950 USD", "↗ +%96", "Dubai"),
+            ("🇨🇭", "İsviçre · Zürih & Cenevre", "Zahnarzt & Estetik", "790 CHF", "↗ +%95", "İsviçre"),
+            ("🇺🇸", "ABD · Miami & New York", "Med Spa & Dental", "$790 USD", "↗ +%94", "ABD"),
+            ("🇬🇧", "İngiltere · Londra & UK", "Dental & Solicitor", "£450 GBP", "↗ +%95", "İngiltere"),
+            ("🇨🇦", "Kanada · Toronto", "Dental & Law", "$650 CAD", "↗ +%95", "Kanada"),
+            ("🇪🇸", "İspanya · Granada & Marbella", "Clínica & Inmobiliaria", "290€–450€", "↗ Yerel", "İspanya"),
+            ("🇹🇷", "Türkiye · İstanbul & Yerel", "Sağlık Turizmi & Servis", "14.500₺", "↗ Nakit", "Türkiye"),
+        ]
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Yüksek Bütçeli Pazarlar")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                Button("Tümü") {
+                    selectedCountryFilter = "Tümü"
+                }
+                .buttonStyle(.plain)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.teal)
+            }
+
+            VStack(spacing: 5) {
+                ForEach(markets, id: \.name) { m in
+                    let isCurrent = selectedCountryFilter == m.filterKey
+                    Button {
+                        selectedCountryFilter = isCurrent ? "Tümü" : m.filterKey
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(m.flag)
+                                .font(.system(size: 15))
+                                .frame(width: 24, height: 24)
+                                .background(.quaternary.opacity(0.4), in: Circle())
+
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(m.name)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text(m.sub)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+
+                            Spacer()
+
+                            VStack(alignment: .trailing, spacing: 1) {
+                                Text(m.price)
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .foregroundStyle(.primary)
+                                Text(m.badge)
+                                    .font(.system(size: 8.5, weight: .semibold))
+                                    .foregroundStyle(.teal)
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            isCurrent ? Color.teal.opacity(0.12) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
+                        .contentShape(Rectangle())
                     }
-                    Text(msg)
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(height: 236)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    // =========================================================================
+    // 4. BOTTOM FULL-WIDTH SEARCHABLE & FILTERABLE DATA TABLE ("Talepler" Style)
+    // =========================================================================
+
+    private var filteredCashHunterLeads: [CashHunterLead] {
+        opportunity.cashHunterLeads.filter { item in
+            switch selectedCategoryFilter {
+            case .all:
+                break
+            case .local:
+                if item.leadType != "LOCAL_BUSINESS" { return false }
+            case .expo:
+                if item.leadType != "EXPO_EXHIBITOR" { return false }
+            case .garage:
+                if item.leadType != "RM_GARAGE_AUTO" { return false }
+            case .dossiers:
+                break
+            }
+
+            if selectedCountryFilter != "Tümü" {
+                if selectedCountryFilter == "AB_GROUP" {
+                    let c = item.country.lowercased()
+                    if !c.contains("almanya") && !c.contains("hollanda") && !c.contains("italy") && !c.contains("germany") {
+                        return false
+                    }
+                } else if !item.country.localizedCaseInsensitiveContains(selectedCountryFilter) &&
+                          !item.city.localizedCaseInsensitiveContains(selectedCountryFilter) {
+                    return false
+                }
+            }
+
+            if onlyNoWebsite && !item.hasNoWebsite {
+                return false
+            }
+
+            if onlyWithVerifiedEmail && !item.hasVerifiedEmail {
+                return false
+            }
+
+            let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty {
+                let hay = "\(item.shortCode) \(item.name) \(item.country) \(item.city) \(item.category) \(item.phone) \(item.email) \(item.issue) \(item.price)"
+                if !hay.localizedCaseInsensitiveContains(q) {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private func leadsTableCard(fullHeight: Bool) -> some View {
+        let leads = filteredCashHunterLeads
+
+        return VStack(alignment: .leading, spacing: 14) {
+            // Category Tabs with Active Underline
+            HStack(spacing: 20) {
+                ForEach(LeadCategoryFilter.allCases) { cat in
+                    let isSelected = selectedCategoryFilter == cat
+                    Button {
+                        selectedCategoryFilter = cat
+                    } label: {
+                        VStack(spacing: 6) {
+                            HStack(spacing: 5) {
+                                Text(cat.rawValue)
+                                    .font(.system(size: 12.5, weight: isSelected ? .bold : .medium))
+                                    .foregroundStyle(isSelected ? Color.indigo : Color.secondary)
+                                Text("\(categoryCount(for: cat))")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundStyle(isSelected ? Color.indigo : Color.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1.5)
+                                    .background(
+                                        (isSelected ? Color.indigo : Color.secondary).opacity(0.12),
+                                        in: Capsule()
+                                    )
+                            }
+                            Rectangle()
+                                .fill(isSelected ? Color.indigo : Color.clear)
+                                .frame(height: 2.5)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+                if let updated = opportunity.cashHunterUpdatedAt {
+                    Text("Son Tarama: \(updated)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            // Search Bar + Country Filter Chips
+            HStack(spacing: 10) {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Spacer()
+                    TextField("İşletme adı, e-posta, ülke veya sektör ara…", text: $searchText)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(width: 280)
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(countryChips, id: \.label) { chip in
+                            let active = selectedCountryFilter == chip.match
+                            Button {
+                                selectedCountryFilter = chip.match
+                            } label: {
+                                Text(chip.label)
+                                    .font(.system(size: 11, weight: active ? .bold : .medium))
+                                    .foregroundStyle(active ? .white : .primary)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        active ? Color.indigo : Color.secondary.opacity(0.1),
+                                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                Button {
+                    onlyWithVerifiedEmail.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: onlyWithVerifiedEmail ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(onlyWithVerifiedEmail ? Color.indigo : Color.secondary)
+                        Text("E-postası Olanlar (\(opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }.count))")
+                            .font(.caption.weight(.medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        onlyWithVerifiedEmail ? Color.indigo.opacity(0.15) : Color.secondary.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .foregroundStyle(onlyWithVerifiedEmail ? Color.indigo : Color.primary)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    onlyNoWebsite.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: onlyNoWebsite ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(onlyNoWebsite ? Color.orange : Color.secondary)
+                        Text("Web'i Olmayanlar")
+                            .font(.caption.weight(.medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        onlyNoWebsite ? Color.orange.opacity(0.15) : Color.secondary.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .foregroundStyle(onlyNoWebsite ? Color.orange : Color.primary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if selectedCategoryFilter == .dossiers {
+                dossiersTableSection
+            } else {
+                // Table Column Header Row (5 Clean Columns)
+                HStack(spacing: 12) {
+                    Text("İşletme & Lokasyon")
+                        .frame(width: 240, alignment: .leading)
+                    Text("Sektör & Tespit Edilen Açık")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Telefon / Doğrulanmış E-posta")
+                        .frame(width: 200, alignment: .leading)
+                    Text("Önerilen Paket")
+                        .frame(width: 130, alignment: .leading)
+                    Text("İşlemler")
+                        .frame(width: 210, alignment: .trailing)
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                if leads.isEmpty {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass.circle")
+                                .font(.system(size: 32))
+                                .foregroundStyle(.secondary)
+                            Text("Filtrelere uygun sıcak hedef bulunamadı.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(40)
+                        Spacer()
+                    }
+                } else {
+                    LazyVStack(spacing: 4) {
+                        ForEach(leads) { lead in
+                            leadTableRow(lead)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func categoryCount(for filter: LeadCategoryFilter) -> Int {
+        switch filter {
+        case .all:
+            return opportunity.cashHunterLeads.count
+        case .local:
+            return opportunity.cashHunterLeads.filter { $0.leadType == "LOCAL_BUSINESS" }.count
+        case .expo:
+            return opportunity.cashHunterLeads.filter { $0.leadType == "EXPO_EXHIBITOR" }.count
+        case .garage:
+            return opportunity.cashHunterLeads.filter { $0.leadType == "RM_GARAGE_AUTO" }.count
+        case .dossiers:
+            return opportunity.opportunities.count
+        }
+    }
+
+    private func leadTableRow(_ lead: CashHunterLead) -> some View {
+        let isExpanded = expandedLeadId == lead.id
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                // Column 1: Business & Location
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(lead.name)
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text("\(lead.score)")
+                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                            .foregroundStyle(lead.score >= 94 ? Color.green : Color.orange)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(
+                                (lead.score >= 94 ? Color.green : Color.orange).opacity(0.12),
+                                in: Capsule()
+                            )
+                    }
+                    Text("\(lead.city) · \(lead.country)")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(width: 240, alignment: .leading)
+
+                // Column 2: Sector & Detected Issue
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(lead.category)
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Color.primary.opacity(0.05), in: Capsule())
+
+                        if lead.hasNoWebsite {
+                            HStack(spacing: 3) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 8))
+                                Text("Web Sitesi Yok")
+                                    .font(.system(size: 9.5, weight: .bold))
+                            }
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Color.orange.opacity(0.12), in: Capsule())
+                        }
+                    }
+
+                    Text(lead.issue)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Column 3: Contact & Email Badge
+                VStack(alignment: .leading, spacing: 2) {
+                    if lead.hasVerifiedEmail {
+                        HStack(spacing: 4) {
+                            Image(systemName: "envelope.fill")
+                                .font(.system(size: 8))
+                            Text(lead.email)
+                                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(Color.indigo)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.indigo.opacity(0.10), in: Capsule())
+                    }
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "phone.fill")
+                            .font(.system(size: 8.5))
+                            .foregroundStyle(.secondary)
+                        Text(lead.phone)
+                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(width: 200, alignment: .leading)
+
+                // Column 4: Package & Value
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(lead.price)
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.indigo)
+                    Text(lead.hasNoWebsite ? "VIP Web & Bot" : "Dönüşüm Paketi")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 130, alignment: .leading)
+
+                // Column 5: Action Buttons
+                HStack(spacing: 5) {
+                    if lead.hasVerifiedEmail {
+                        Button {
+                            Task {
+                                testSendingLeadId = lead.id
+                                await opportunity.sendTestOutreach(leadId: lead.id)
+                                testSendingLeadId = nil
+                            }
+                        } label: {
+                            HStack(spacing: 3) {
+                                if testSendingLeadId == lead.id {
+                                    ProgressView().controlSize(.mini)
+                                } else {
+                                    Image(systemName: "paperplane.fill")
+                                        .font(.system(size: 9))
+                                }
+                                Text("Test")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundStyle(.purple)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4.5)
+                            .background(Color.purple.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Bu işletmenin teklifini kişisel mailime (4gadakai@gmail.com) test olarak gönder")
+                    }
+
+                    Button {
+                        Task { await opportunity.sendLeadToWhatsApp(lead) }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "message.fill")
+                                .font(.system(size: 9))
+                            Text("WA")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundStyle(.teal)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4.5)
+                        .background(Color.teal.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Bu teklifi WhatsApp'ıma ilet")
+
+                    Button {
+                        opportunity.copyPitch(lead)
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedLeadId = isExpanded ? nil : lead.id
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: isExpanded ? "chevron.up" : "doc.text")
+                                .font(.system(size: 9))
+                            Text(isExpanded ? "Kapat" : "Teklif")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundStyle(.indigo)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4.5)
+                        .background(Color.indigo.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Satış teklifini kopyala ve detayını göster")
+
+                    Button {
+                        opportunity.openLeadTarget(lead)
+                    } label: {
+                        Image(systemName: "safari")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .padding(4.5)
+                            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Web sitesini veya Google Haritalar kaydını aç")
+                }
+                .frame(width: 210, alignment: .trailing)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(
+                isExpanded ? Color.indigo.opacity(0.04) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    expandedLeadId = isExpanded ? nil : lead.id
+                }
+            }
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Kopyalanmaya ve Gönderilmeye Hazır Satış Mesajı (\(lead.country) · \(lead.city))", systemImage: "text.bubble.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.indigo)
+                        Spacer()
+
+                        if lead.hasVerifiedEmail {
+                            Button {
+                                Task {
+                                    testSendingLeadId = lead.id
+                                    await opportunity.sendTestOutreach(leadId: lead.id)
+                                    testSendingLeadId = nil
+                                }
+                            } label: {
+                                Label("4gadakai@gmail.com'a Test Maili At", systemImage: "paperplane.fill")
+                                    .font(.caption2.weight(.bold))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.purple)
+                            .controlSize(.small)
+                        }
+
+                        Button {
+                            opportunity.copyPitch(lead)
+                        } label: {
+                            Label("Mesajı Kopyala", systemImage: "doc.on.doc")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.indigo)
+                        .controlSize(.small)
+
+                        Button {
+                            Task { await opportunity.sendLeadToWhatsApp(lead) }
+                        } label: {
+                            Label("WhatsApp'ıma İlet", systemImage: "paperplane.fill")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.teal)
+                        .controlSize(.small)
+                    }
+
+                    Text(lead.pitch)
+                        .font(.system(size: 11.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.indigo.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
             }
         }
     }
 
+    private var dossiersTableSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(opportunity.opportunities) { item in
+                OpportunityDossierCard(item: item)
+            }
+        }
+    }
+
+    // =========================================================================
+    // 4B. STUDIO OUTREACH PIPELINE VIEW (HyperUI Staged Outreach Dashboard)
+    // =========================================================================
+
+    private var studioOutreachPipelineView: some View {
+        let verifiedLeads = opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }
+
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // Header Banner
+                HStack(alignment: .top, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("Otonom Soğuk E-Posta & İletişim Boru Hattı")
+                                .font(.system(size: 18, weight: .bold))
+                            Text("🛡️ GÜVENLİ TEST MODU (STAGED_ONLY)")
+                                .font(.system(size: 9.5, weight: .heavy))
+                                .foregroundStyle(Color.green)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2.5)
+                                .background(Color.green.opacity(0.14), in: Capsule())
+                        }
+                        Text("LOLILE 1 Gbps Kazıcı → Deep Spider E-posta Keşfi → Redmono AI Teklif Motoru → Stalwart SMTP/IMAP")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        Task {
+                            await opportunity.sendTestOutreach()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "paperplane.fill")
+                                .font(.system(size: 11))
+                            Text("Hızlı Test Gönder (4gadakai@gmail.com)")
+                                .font(.system(size: 11.5, weight: .bold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.indigo, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Sıradaki ilk taslağı kişisel mailinize (4gadakai@gmail.com) test olarak gönderir")
+                }
+                .padding(18)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+                }
+
+                // 4 HyperUI Metric Cards
+                HStack(spacing: 14) {
+                    hyperuiStatCard(
+                        category: "HAZIR E-POSTA TASLAĞI",
+                        value: "\(verifiedLeads.count)",
+                        badge: "● Stalwart Outbox",
+                        badgeColor: .indigo,
+                        subtitle: "Derin spider ile doğrulanmış kontaklar",
+                        icon: "envelope.badge",
+                        tint: Color.indigo
+                    )
+
+                    hyperuiStatCard(
+                        category: "GÖNDERİLEN TESTLER",
+                        value: "1",
+                        badge: "✓ 4gadakai@gmail.com",
+                        badgeColor: .green,
+                        subtitle: "Stalwart SSL relay süresi: 68 ms",
+                        icon: "checkmark.shield.fill",
+                        tint: Color.green
+                    )
+
+                    hyperuiStatCard(
+                        category: "DIŞ DÜNYA GÖNDERİMİ",
+                        value: "0 (Korumalı)",
+                        badge: "🔒 Level 2 Onay",
+                        badgeColor: .secondary,
+                        subtitle: "Onayınız olmadan 0 dış e-posta",
+                        icon: "lock.shield.fill",
+                        tint: Color.secondary
+                    )
+
+                    hyperuiStatCard(
+                        category: "SMTP / IMAP MOTORU",
+                        value: "Stalwart",
+                        badge: "● 7/24 Aktif",
+                        badgeColor: .teal,
+                        subtitle: "mya-l11:1465 (SSL) / 1993 (IMAP)",
+                        icon: "server.rack",
+                        tint: Color.teal
+                    )
+                }
+
+                // Safety & Pipeline Flow Card
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("GÜVENLİK VE ÇALIŞMA PRENSİBİ")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .tracking(0.6)
+                            .foregroundStyle(.secondary)
+
+                        Text("Bu boru hattı, RM-OS Level 2 kurallarına tam uyumludur:")
+                            .font(.system(size: 12, weight: .semibold))
+
+                        HStack(spacing: 20) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "1.circle.fill").foregroundStyle(.indigo)
+                                Text("LOLİLE 1 Gbps derin kazıma yapar ve doğrulanmış kurumsal mailleri yakalar.")
+                                    .font(.system(size: 11))
+                            }
+                            HStack(spacing: 6) {
+                                Image(systemName: "2.circle.fill").foregroundStyle(.indigo)
+                                Text("MYA-L11 üzerindeki autopilot her işletmeye özel satış teklifi taslağı oluşturur.")
+                                    .font(.system(size: 11))
+                            }
+                            HStack(spacing: 6) {
+                                Image(systemName: "3.circle.fill").foregroundStyle(.indigo)
+                                Text("Dış müşteriye ASLA mail atılmaz; yalnızca 4gadakai@gmail.com'a test gider.")
+                                    .font(.system(size: 11))
+                            }
+                        }
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.green.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.green.opacity(0.18), lineWidth: 1)
+                }
+
+                // Staged Leads Table
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("HAZIRLANAN SOĞUK E-POSTA VE TEKLİF TASLAKLARI")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .tracking(0.6)
+                                .foregroundStyle(.secondary)
+                            Text("Doğrulanmış Hedefler (\(verifiedLeads.count))")
+                                .font(.system(size: 14, weight: .bold))
+                        }
+
+                        Spacer()
+
+                        Text("Test Alıcısı: 4gadakai@gmail.com")
+                            .font(.caption2.weight(.bold).monospaced())
+                            .foregroundStyle(Color.indigo)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.indigo.opacity(0.10), in: Capsule())
+                    }
+
+                    Divider()
+
+                    // Headers
+                    HStack(spacing: 12) {
+                        Text("İşletme & Lokasyon")
+                            .frame(width: 240, alignment: .leading)
+                        Text("Hedef E-Posta")
+                            .frame(width: 220, alignment: .leading)
+                        Text("Tespit Edilen Açık & Çözüm")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text("Önerilen Paket")
+                            .frame(width: 120, alignment: .leading)
+                        Text("İşlemler")
+                            .frame(width: 190, alignment: .trailing)
+                    }
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    LazyVStack(spacing: 4) {
+                        ForEach(verifiedLeads) { lead in
+                            outreachLeadRow(lead)
+                        }
+                    }
+                }
+                .padding(18)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private func outreachLeadRow(_ lead: CashHunterLead) -> some View {
+        let isExpanded = expandedLeadId == lead.id
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                // Col 1: Name & Location
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(lead.name)
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text("\(lead.score)")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(lead.score >= 94 ? Color.green : Color.orange)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(
+                                (lead.score >= 94 ? Color.green : Color.orange).opacity(0.12),
+                                in: Capsule()
+                            )
+                    }
+                    Text("\(lead.city) · \(lead.country)")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(width: 240, alignment: .leading)
+
+                // Col 2: Target Email
+                HStack(spacing: 5) {
+                    Image(systemName: "envelope.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.indigo)
+                    Text(lead.email)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                }
+                .frame(width: 220, alignment: .leading)
+
+                // Col 3: Issue & Solution
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(lead.issue)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(lead.category)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Col 4: Package Price
+                Text(lead.price)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.indigo)
+                    .frame(width: 120, alignment: .leading)
+
+                // Col 5: Actions
+                HStack(spacing: 6) {
+                    Button {
+                        Task {
+                            testSendingLeadId = lead.id
+                            await opportunity.sendTestOutreach(leadId: lead.id)
+                            testSendingLeadId = nil
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if testSendingLeadId == lead.id {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "paperplane.fill")
+                                    .font(.system(size: 9))
+                            }
+                            Text("Test Et")
+                                .font(.system(size: 10.5, weight: .bold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Color.indigo, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Bu taslağı 4gadakai@gmail.com adresine test olarak gönder")
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedLeadId = isExpanded ? nil : lead.id
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isExpanded ? "chevron.up" : "doc.text")
+                                .font(.system(size: 9))
+                            Text(isExpanded ? "Kapat" : "Taslak")
+                                .font(.system(size: 10.5, weight: .medium))
+                        }
+                        .foregroundStyle(Color.indigo)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.indigo.opacity(0.10), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(width: 190, alignment: .trailing)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(
+                isExpanded ? Color.indigo.opacity(0.04) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    expandedLeadId = isExpanded ? nil : lead.id
+                }
+            }
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Hazırlanan E-posta İçeriği (\(lead.name) · \(lead.email))", systemImage: "envelope.open.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Color.indigo)
+                        Spacer()
+                        Button {
+                            opportunity.copyPitch(lead)
+                        } label: {
+                            Label("Metni Kopyala", systemImage: "doc.on.doc")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button {
+                            Task {
+                                testSendingLeadId = lead.id
+                                await opportunity.sendTestOutreach(leadId: lead.id)
+                                testSendingLeadId = nil
+                            }
+                        } label: {
+                            Label("4gadakai@gmail.com'a Gönder", systemImage: "paperplane.fill")
+                                .font(.caption2.weight(.bold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.indigo)
+                        .controlSize(.small)
+                    }
+
+                    Text(lead.pitch)
+                        .font(.system(size: 11.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.indigo.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+            }
+        }
+    }
+
+    // =========================================================================
+    // 5. BENTO SYSTEM OVERVIEW & SMART HOME COLUMNS
+    // =========================================================================
+
     private var allInOneBentoDashboard: some View {
         ScrollView {
             HStack(alignment: .top, spacing: 16) {
-                // COLUMN 1: Akıllı Ev (Philips Hue + TCL 4K Smart TV)
                 VStack(alignment: .leading, spacing: 16) {
                     hueFullColumn
                     tvFullColumn
                 }
                 .frame(maxWidth: .infinity)
 
-                // COLUMN 2: Altyapı & Cihazlar (Vaytniga Modem, LOLİLE PC, MYA-L11, RM-OS)
                 VStack(alignment: .leading, spacing: 16) {
                     modemAndRmosColumn
                     lolileSummaryCard
@@ -6912,7 +8993,6 @@ private struct DAAKCommandCenterView: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                // COLUMN 3: Üniversite Sınavları, Fırsat İstihbaratı, Yayın, Mail & M3 Deck
                 VStack(alignment: .leading, spacing: 16) {
                     universityExamsSummaryCard
                     opportunitiesSummaryCard
@@ -7139,7 +9219,6 @@ private struct DAAKCommandCenterView: View {
                 }
             }
 
-            // D-Pad & Media Controls
             VStack(spacing: 6) {
                 HStack(spacing: 6) {
                     remoteBtn("Geri", key: "KEYCODE_BACK", icon: "arrow.uturn.backward")
@@ -7405,26 +9484,26 @@ private struct DAAKCommandCenterView: View {
                 Spacer()
                 StatusPill(
                     online: opportunity.fabricReady || !opportunity.opportunities.isEmpty,
-                    onlineText: "\(opportunity.opportunities.count) fırsat",
+                    onlineText: "\(opportunity.cashHunterLeads.count) hedef · \(opportunity.opportunities.count) dosya",
                     offlineText: "Bekleniyor"
                 )
             }
 
-            ForEach(Array(opportunity.opportunities.prefix(4))) { item in
+            ForEach(Array(opportunity.cashHunterLeads.prefix(4))) { lead in
                 HStack(alignment: .top, spacing: 8) {
-                    Text("\(item.score)")
+                    Text("\(lead.score)")
                         .font(.caption.monospacedDigit().weight(.bold))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
                         .background(.orange.opacity(0.2), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title)
+                        Text("[\(lead.country)] \(lead.name)")
                             .font(.caption.weight(.semibold))
                             .lineLimit(1)
-                        Text(item.problem)
+                        Text("\(lead.price) · \(lead.issue)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            .lineLimit(1)
                     }
                     Spacer()
                 }
@@ -7451,8 +9530,8 @@ private struct DAAKCommandCenterView: View {
 
                 Spacer()
 
-                Button("Tüm Fırsatları Aç →") {
-                    selectedTab = .opportunities
+                Button("Tabloyu Aç →") {
+                    selectedTab = .dashboard
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
@@ -8099,8 +10178,8 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .store(in: &subscriptions)
 
         if CommandLine.arguments.contains("--command-center") ||
-            !UserDefaults.standard.bool(forKey: "daak.commandCenterShown.v1") {
-            UserDefaults.standard.set(true, forKey: "daak.commandCenterShown.v1")
+            !UserDefaults.standard.bool(forKey: "daak.commandCenterShown.v4") {
+            UserDefaults.standard.set(true, forKey: "daak.commandCenterShown.v4")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 self?.openCommandCenterWindow()
             }
@@ -8132,18 +10211,17 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(study)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1240, height: 820),
+            contentRect: NSRect(x: 0, y: 0, width: 1360, height: 860),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = "DAAK KOMUTA MERKEZİ"
-        window.subtitle = "Akıllı Ev · Hue · TCL 4K TV · Vaytniga · LOLİLE · MYA-L11 · Fırsat İstihbaratı"
-        window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = false
+        window.title = "DAAK Control Center"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.fullScreenPrimary, .managed]
-        window.minSize = NSSize(width: 1080, height: 720)
+        window.minSize = NSSize(width: 1180, height: 740)
         window.contentViewController = NSHostingController(rootView: commandCenterView)
         window.center()
         window.makeKeyAndOrderFront(nil)

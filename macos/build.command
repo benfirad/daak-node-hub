@@ -31,7 +31,8 @@ xcrun --sdk macosx swiftc \
   -o "$MACOS_DIR/daakLOLILE" \
   "$ROOT/Sources/daakLOLILEApp.swift" \
   -framework SwiftUI \
-  -framework AppKit
+  -framework AppKit \
+  -framework PDFKit
 
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/update-daak-node.zsh" "$RESOURCES_DIR/update-daak-node.zsh"

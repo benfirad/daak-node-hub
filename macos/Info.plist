@@ -15,15 +15,15 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.19.0</string>
+	<string>2.20.0</string>
 	<key>CFBundleVersion</key>
-	<string>30</string>
+	<string>31</string>
 	<key>DAAKSingleInstanceLockVersion</key>
 	<integer>1</integer>
 	<key>DAAKSourceCommit</key>
 	<string>development</string>
 	<key>DAAKSourceVariant</key>
-	<string>smart-home-and-university-study-hub</string>
+	<string>university-pdf-study-engine</string>
 	<key>DAAKUpdateChannel</key>
 	<string>main</string>
   <key>LSMinimumSystemVersion</key>
