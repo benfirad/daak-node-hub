@@ -753,9 +753,9 @@ private final class UpdateMonitor: ObservableObject {
     private let lastCheckKey = "DAAKNodeLastUpdateCheck"
 
     var versionLabel: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.20.0"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.21.0"
         let commit = Bundle.main.object(forInfoDictionaryKey: "DAAKSourceCommit") as? String ?? "development"
-        return "v\(version) (PDF Study Hub) • \(String(commit.prefix(7)))"
+        return "v\(version) (Live Modem) • \(String(commit.prefix(7)))"
     }
 
     init() {
@@ -3734,6 +3734,51 @@ private struct DeviceOverviewView: View {
                         .stroke(.white.opacity(0.07), lineWidth: 0.5)
                 }
 
+                // Live Vaytniga S9+ Modem Card (5 sn yenileme)
+                Button {
+                    selection = .smartHome
+                } label: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(smartHome.modem?.online == true ? Color.green : Color.orange)
+                                .frame(width: 36, height: 36)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("VAYTNIGA S9+ MODEM · CANLI")
+                                    .font(.subheadline.weight(.bold))
+                                Text(smartHome.modem.map { "\($0.operatorName) · \($0.signalQualityLabel)" } ?? "ADB bağlantısı bekleniyor")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            if smartHome.isRefreshingModem {
+                                ProgressView().controlSize(.mini)
+                            }
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        if let modem = smartHome.modem, modem.online {
+                            HStack(spacing: 0) {
+                                modemStat(title: "İndirme", value: modem.liveDownloadLabel, tint: .green)
+                                modemStat(title: "Yükleme", value: modem.liveUploadLabel, tint: .blue)
+                                modemStat(title: "Ping", value: modem.pingLabel, tint: modem.pingMs > 150 || modem.pingMs == 0 ? .orange : .mint)
+                                modemStat(title: "Cihaz", value: "\(modem.clients)", tint: .secondary)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(.white.opacity(0.07), lineWidth: 0.5)
+                    }
+                }
+                .buttonStyle(DAAKPressStyle())
+
                 // Upcoming Exams & Course Notes Quick Card
                 Button {
                     selection = .study
@@ -3848,6 +3893,20 @@ private struct DeviceOverviewView: View {
             .padding(16)
         }
         .frame(maxHeight: 690)
+    }
+
+    private func modemStat(title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.bold).monospacedDigit())
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -4937,8 +4996,26 @@ struct ModemTelemetry: Equatable {
     var eth0IP: String
     var battery: Int
     var tempTenths: Int
+    var voltageMV: Int
+    var rxGB: String
+    var txGB: String
     var totalGB: String
+    var rxKbps: Double
+    var txKbps: Double
+    var rxMbps: Double
+    var txMbps: Double
+    var rsrp: Int
+    var rsrq: Int
+    var sinr: Int
+    var cqi: Int
+    var signalLevel: Int
+    var caActive: Bool
+    var earfcn: Int
+    var pingMs: Double
     var clients: Int
+    var clientIPs: String
+    var adbdFDs: Int
+    var uptime: String
 
     var temperatureCelsius: Double {
         Double(tempTenths) / 10.0
@@ -4946,6 +5023,45 @@ struct ModemTelemetry: Equatable {
 
     var hueEthernetHealthy: Bool {
         !eth0IP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var liveDownloadLabel: String {
+        rxMbps >= 1.0 ? String(format: "↓ %.1f Mbps", rxMbps) : String(format: "↓ %.0f KB/s", rxKbps)
+    }
+
+    var liveUploadLabel: String {
+        txMbps >= 1.0 ? String(format: "↑ %.1f Mbps", txMbps) : String(format: "↑ %.0f KB/s", txKbps)
+    }
+
+    var liveSpeedSummary: String {
+        "\(liveDownloadLabel) · \(liveUploadLabel)"
+    }
+
+    var pingLabel: String {
+        pingMs > 0 ? String(format: "%.0f ms", pingMs) : "—"
+    }
+
+    var signalQualityLabel: String {
+        let caText = caActive ? "LTE+ (CA)" : netType
+        return "\(caText) · RSRP \(rsrp) dBm · SINR \(sinr) dB · CQI \(cqi)"
+    }
+
+    var parsedClientLabels: [String] {
+        let tokens = clientIPs.split(separator: " ").map(String.init)
+        return tokens.map { token in
+            if token.contains("192.168.34.194") {
+                return "MacBook (kai) · 192.168.34.194 (5GHz)"
+            } else if token.contains("192.168.34.182") {
+                return "TCL 4K Smart TV · 192.168.34.182 (5GHz)"
+            } else if token.contains("192.168.236.62") {
+                return "Philips Hue Bridge · 192.168.236.62 (eth0)"
+            } else if token.contains("192.168.34.46") {
+                return "İstemci (.46) · 192.168.34.46 (5GHz)"
+            } else if token.contains("192.168.34.237") {
+                return "İstemci (.237) · 192.168.34.237 (5GHz)"
+            }
+            return token
+        }
     }
 }
 
@@ -4959,6 +5075,7 @@ final class SmartHomeMonitor: ObservableObject {
     @Published var tv: TVTelemetry?
     @Published var modem: ModemTelemetry?
     @Published var isRefreshing = false
+    @Published var isRefreshingModem = false
     @Published var isWorking = false
     @Published var actionMessage: String?
     @Published var tvBrightness: Double = 0.75
@@ -4966,6 +5083,7 @@ final class SmartHomeMonitor: ObservableObject {
 
     var openCommandCenterWindow: (() -> Void)?
     private var timer: Timer?
+    private var modemTimer: Timer?
 
     var anyLightOn: Bool {
         lights.contains(where: \.on)
@@ -4997,6 +5115,20 @@ final class SmartHomeMonitor: ObservableObject {
                 await self.refresh()
             }
         }
+        modemTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                await self.refreshModemOnly()
+            }
+        }
+    }
+
+    func refreshModemOnly() async {
+        guard !isRefreshingModem && !isRefreshing else { return }
+        isRefreshingModem = true
+        defer { isRefreshingModem = false }
+        let modemOut = await LocalCommand.run("/Users/kai/bin/daak-modem", ["json"])
+        parseModemJSON(modemOut.output)
     }
 
     func refresh() async {
@@ -5066,6 +5198,20 @@ final class SmartHomeMonitor: ObservableObject {
         )
     }
 
+    private func parseDouble(_ any: Any?) -> Double {
+        if let d = any as? Double { return d }
+        if let i = any as? Int { return Double(i) }
+        if let s = any as? String, let d = Double(s) { return d }
+        return 0
+    }
+
+    private func parseInt(_ any: Any?, fallback: Int = 0) -> Int {
+        if let i = any as? Int { return i }
+        if let d = any as? Double { return Int(d) }
+        if let s = any as? String, let i = Int(s) { return i }
+        return fallback
+    }
+
     private func parseModemJSON(_ raw: String) {
         guard let data = raw.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -5075,16 +5221,34 @@ final class SmartHomeMonitor: ObservableObject {
         modem = ModemTelemetry(
             online: online,
             serial: (root["serial"] as? String) ?? "192.168.34.12:5555",
-            upstream: (root["upstream"] as? String) ?? "",
+            upstream: (root["upstream"] as? String) ?? "rmnet0",
             wanIP: (root["wan_ip"] as? String) ?? "",
-            operatorName: (root["operator"] as? String) ?? "Vodafone",
+            operatorName: (root["operator"] as? String) ?? "Vodafone ES",
             netType: (root["net_type"] as? String) ?? "LTE",
             hotspot5GHz: (root["hotspot_5ghz"] as? Bool) ?? true,
             eth0IP: (root["eth0_ip"] as? String) ?? "",
-            battery: (root["battery"] as? Int) ?? 100,
-            tempTenths: (root["temp_tenths"] as? Int) ?? 340,
+            battery: parseInt(root["battery"], fallback: 100),
+            tempTenths: parseInt(root["temp_tenths"], fallback: 340),
+            voltageMV: parseInt(root["voltage_mv"], fallback: 4200),
+            rxGB: (root["rx_gb"] as? String) ?? "0",
+            txGB: (root["tx_gb"] as? String) ?? "0",
             totalGB: (root["total_gb"] as? String) ?? "0",
-            clients: (root["clients"] as? Int) ?? 0
+            rxKbps: parseDouble(root["rx_kbps"]),
+            txKbps: parseDouble(root["tx_kbps"]),
+            rxMbps: parseDouble(root["rx_mbps"]),
+            txMbps: parseDouble(root["tx_mbps"]),
+            rsrp: parseInt(root["rsrp"], fallback: -94),
+            rsrq: parseInt(root["rsrq"], fallback: -8),
+            sinr: parseInt(root["sinr"], fallback: 20),
+            cqi: parseInt(root["cqi"], fallback: 12),
+            signalLevel: parseInt(root["signal_level"], fallback: 4),
+            caActive: (root["ca_active"] as? Bool) ?? true,
+            earfcn: parseInt(root["earfcn"], fallback: 1501),
+            pingMs: parseDouble(root["ping_ms"]),
+            clients: parseInt(root["clients"], fallback: 0),
+            clientIPs: (root["client_ips"] as? String) ?? "",
+            adbdFDs: parseInt(root["adbd_fds"], fallback: 25),
+            uptime: (root["uptime"] as? String) ?? ""
         )
     }
 
@@ -5196,6 +5360,14 @@ final class SmartHomeMonitor: ObservableObject {
 
     func runModemSpeedtest() async {
         await performAction("Vaytniga hız testi", command: "/Users/kai/bin/daak-modem", arguments: ["speedtest"])
+    }
+
+    func optimizeModemBufferbloat() async {
+        await performAction("Modem Bufferbloat & Kuyruk Optimizasyonu", command: "/Users/kai/bin/daak-modem", arguments: ["optimize"])
+    }
+
+    func resetModemLTE() async {
+        await performAction("LTE+ Mobil Veri Yenileme", command: "/Users/kai/bin/daak-modem", arguments: ["reset-lte"])
     }
 
     func syncRMOS() async {
@@ -6941,6 +7113,16 @@ private struct SmartHomeView: View {
 
                     if let modem = smartHome.modem {
                         HStack(spacing: 10) {
+                            Text(modem.liveSpeedSummary)
+                                .foregroundStyle(.green)
+                            Text("·")
+                            Text("Ping \(modem.pingLabel)")
+                                .foregroundStyle(modem.pingMs > 150 || modem.pingMs == 0 ? Color.orange : Color.mint)
+                            Spacer()
+                            Text("RSRP \(modem.rsrp) · SINR \(modem.sinr)")
+                        }
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        HStack(spacing: 10) {
                             Text("Pil %\(modem.battery) · \(String(format: "%.1f°C", modem.temperatureCelsius))")
                             Text("·")
                             Text("Hue eth0: \(modem.hueEthernetHealthy ? modem.eth0IP : "Kapalı")")
@@ -7379,7 +7561,7 @@ private struct DAAKCommandCenterView: View {
                         Text("DAAK NODE")
                             .font(.system(size: 14, weight: .heavy, design: .rounded))
                             .tracking(0.5)
-                        Text("KONTROL MERKEZİ · v2.20.0")
+                        Text("KONTROL MERKEZİ · v2.21.0")
                             .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
@@ -9279,11 +9461,53 @@ private struct DAAKCommandCenterView: View {
             }
 
             if let modem = smartHome.modem {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("İNDİRME").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                        Text(modem.liveDownloadLabel).font(.title3.weight(.bold).monospacedDigit()).foregroundStyle(.green)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("YÜKLEME").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                        Text(modem.liveUploadLabel).font(.title3.weight(.bold).monospacedDigit()).foregroundStyle(.blue)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("PING").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                        Text(modem.pingLabel).font(.title3.weight(.bold).monospacedDigit())
+                            .foregroundStyle(modem.pingMs > 150 || modem.pingMs == 0 ? Color.orange : Color.mint)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(10)
+                .background(.background.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
                 VStack(spacing: 6) {
+                    MetricRow(title: "LTE Sinyal", value: modem.signalQualityLabel)
+                    MetricRow(title: "RSRQ · EARFCN", value: "\(modem.rsrq) dB · \(modem.earfcn)")
+                    MetricRow(title: "WAN (rmnet0)", value: modem.wanIP.isEmpty ? modem.upstream : modem.wanIP)
                     MetricRow(title: "Ethernet Tethering (Hue)", value: modem.hueEthernetHealthy ? modem.eth0IP : "Devre dışı (Onar'a bas)")
                     MetricRow(title: "5GHz Wi-Fi Hotspot", value: "\(modem.hotspot5GHz ? "Aktif" : "Kapalı") · \(modem.clients) istemci")
                     MetricRow(title: "Pil & Sıcaklık", value: "%\(modem.battery) · \(String(format: "%.1f°C", modem.temperatureCelsius))")
-                    MetricRow(title: "Toplam Trafik", value: "\(modem.totalGB) GB · WAN \(modem.wanIP.isEmpty ? modem.upstream : modem.wanIP)")
+                    MetricRow(title: "Toplam Trafik", value: "↓ \(modem.rxGB) GB · ↑ \(modem.txGB) GB")
+                    MetricRow(title: "Çalışma Süresi · ADB soket", value: "\(modem.uptime) · \(modem.adbdFDs)")
+                }
+
+                if !modem.parsedClientLabels.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("BAĞLI CİHAZLAR")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        ForEach(modem.parsedClientLabels, id: \.self) { label in
+                            HStack(spacing: 6) {
+                                Circle().fill(Color.green).frame(width: 6, height: 6)
+                                Text(label).font(.caption2)
+                            }
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.background.opacity(0.4), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
             }
 
@@ -9313,6 +9537,29 @@ private struct DAAKCommandCenterView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    Task { await smartHome.resetModemLTE() }
+                } label: {
+                    Label("LTE Yenile", systemImage: "antenna.radiowaves.left.and.right")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .controlSize(.small)
+                .help("Mobil veriyi kapatıp açar, yeni LTE oturumu alır (~6 sn kesinti)")
+
+                Button {
+                    Task { await smartHome.optimizeModemBufferbloat() }
+                } label: {
+                    Label("Gecikme Optimize", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("rmnet0/wlan1 kuyruklarını kısaltır, TCP keepalive'ı düzeltir")
             }
 
             Divider()
