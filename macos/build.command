@@ -39,9 +39,11 @@ cp "$ROOT/Resources/update-daak-node.zsh" "$RESOURCES_DIR/update-daak-node.zsh"
 cp "$ROOT/Resources/daak-broadcast-control.zsh" "$RESOURCES_DIR/daak-broadcast-control.zsh"
 cp "$ROOT/Resources/daak-broadcast-receiver.zsh" "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
 cp "$ROOT/Resources/create_m3_scene.lua" "$RESOURCES_DIR/create_m3_scene.lua"
+cp "$ROOT/Resources/daak-expense-collector.py" "$RESOURCES_DIR/daak-expense-collector.py"
 chmod 755 "$RESOURCES_DIR/update-daak-node.zsh" \
   "$RESOURCES_DIR/daak-broadcast-control.zsh" \
-  "$RESOURCES_DIR/daak-broadcast-receiver.zsh"
+  "$RESOURCES_DIR/daak-broadcast-receiver.zsh" \
+  "$RESOURCES_DIR/daak-expense-collector.py"
 
 SOURCE_COMMIT="${DAAK_NODE_SOURCE_COMMIT:-}"
 if [[ -z "$SOURCE_COMMIT" ]] && command -v git >/dev/null 2>&1; then
@@ -51,7 +53,7 @@ if printf '%s' "$SOURCE_COMMIT" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'; then
   /usr/libexec/PlistBuddy -c "Set :DAAKSourceCommit $SOURCE_COMMIT" "$CONTENTS/Info.plist"
 fi
 xattr -cr "$APP"
-codesign --force --deep --sign - "$APP"
+codesign --force --deep --sign "-" "$APP"
 xattr -cr "$APP"
 codesign --verify --deep --strict "$APP"
 

@@ -7277,14 +7277,1140 @@ private struct HueLightRow: View {
     }
 }
 
+
+// MARK: - Maliye & Fiş Kütüğü (Thermal Receipt & Expense Engine)
+
+
+private struct ExpenseItem: Codable, Identifiable, Equatable {
+    var id: String { name + "\(price)" }
+    let name: String
+    let qty: Int
+    let price: Double
+    let currency: String?
+}
+
+private struct ExpenseRecord: Codable, Identifiable, Equatable {
+    let id: String
+    let date: String
+    let merchant: String
+    let category: String
+    let amount: Double
+    let currency: String
+    let taxAmount: Double?
+    let taxRate: Double?
+    let paymentMethod: String?
+    let invoiceNumber: String?
+    let status: String?
+    let source: String?
+    let mailMessageId: String?
+    let subject: String?
+    let items: [ExpenseItem]?
+    let rawSnippet: String?
+    let notes: String?
+
+    var symbol: String {
+        switch currency {
+        case "EUR": return "€"
+        case "USD": return "$"
+        case "TRY", "TL": return "₺"
+        case "GBP": return "£"
+        default: return currency
+        }
+    }
+
+    var formattedAmount: String {
+        String(format: "%@%.2f", symbol, amount)
+    }
+
+    var formattedTax: String {
+        String(format: "%@%.2f", symbol, taxAmount ?? 0.0)
+    }
+
+    var formattedSubtotal: String {
+        let tax = taxAmount ?? 0.0
+        let sub = amount >= tax ? (amount - tax) : amount
+        return String(format: "%@%.2f", symbol, sub)
+    }
+
+    var categoryColor: Color {
+        if category.contains("AI") || category.contains("Yazılım") { return .indigo }
+        if category.contains("Altyapı") || category.contains("Sunucu") { return .blue }
+        if category.contains("Yakıt") || category.contains("Garage") { return .orange }
+        if category.contains("Ofis") || category.contains("Kira") { return .purple }
+        if category.contains("İletişim") { return .teal }
+        if category.contains("Vergi") || category.contains("Kamu") { return .red }
+        return .secondary
+    }
+
+    var categoryIcon: String {
+        if category.contains("AI") || category.contains("Yazılım") { return "sparkles" }
+        if category.contains("Altyapı") || category.contains("Sunucu") { return "server.rack" }
+        if category.contains("Yakıt") || category.contains("Garage") { return "fuelpump.fill" }
+        if category.contains("Ofis") || category.contains("Kira") { return "house.fill" }
+        if category.contains("İletişim") { return "antenna.radiowaves.left.and.right" }
+        if category.contains("Vergi") || category.contains("Kamu") { return "building.columns.fill" }
+        return "cart.fill"
+    }
+}
+
+private struct ExpenseStats: Codable, Equatable {
+    let total_count: Int?
+    let total_eur_equivalent: Double?
+    let total_tax_eur_equivalent: Double?
+    let by_currency: [String: Double]?
+    let by_category_eur: [String: Double]?
+    let by_month_eur: [String: Double]?
+}
+
+private struct ExpenseDatabase: Codable {
+    let version: String?
+    let updated_at: String?
+    let currency_rates: [String: Double]?
+    let stats: ExpenseStats?
+    let expenses: [ExpenseRecord]
+}
+
+
+
+@MainActor
+private final class ExpenseMonitor: ObservableObject {
+    @Published var records: [ExpenseRecord] = []
+    @Published var stats: ExpenseStats?
+    @Published var isScanning = false
+    @Published var actionMessage: String?
+    @Published var selectedCategory: String = "Tümü"
+    @Published var selectedCurrency: String = "Tümü"
+    @Published var searchText: String = ""
+    @Published var selectedRecordID: String?
+    @Published var receiptViewMode: String = "summary"
+    @Published var showPasteModal: Bool = false
+    @Published var showAddModal: Bool = false
+
+    private let jsonPath = NSHomeDirectory() + "/Library/Application Support/DAAK/expenses.json"
+    private var collectorScript: String {
+        if let res = Bundle.main.resourcePath {
+            let inBundle = res + "/daak-expense-collector.py"
+            if FileManager.default.fileExists(atPath: inBundle) {
+                return inBundle
+            }
+        }
+        return NSHomeDirectory() + "/Library/Application Support/DAAK/daak-expense-collector.py"
+    }
+
+    init() {
+        loadFromDisk()
+    }
+
+    var selectedRecord: ExpenseRecord? {
+        if let id = selectedRecordID {
+            return records.first { $0.id == id }
+        }
+        return records.first
+    }
+
+    var filteredRecords: [ExpenseRecord] {
+        records.filter { rec in
+            if selectedCategory != "Tümü" && !rec.category.contains(selectedCategory) {
+                return false
+            }
+            if selectedCurrency != "Tümü" && rec.currency != selectedCurrency {
+                return false
+            }
+            if !searchText.isEmpty {
+                let q = searchText.lowercased()
+                let match = rec.merchant.lowercased().contains(q) ||
+                    (rec.invoiceNumber ?? "").lowercased().contains(q) ||
+                    rec.category.lowercased().contains(q) ||
+                    (rec.paymentMethod ?? "").lowercased().contains(q) ||
+                    (rec.rawSnippet ?? "").lowercased().contains(q)
+                if !match { return false }
+            }
+            return true
+        }
+    }
+
+    func loadFromDisk() {
+        guard FileManager.default.fileExists(atPath: jsonPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
+              let decoded = try? JSONDecoder().decode(ExpenseDatabase.self, from: data) else {
+            return
+        }
+        records = decoded.expenses
+        stats = decoded.stats
+        if selectedRecordID == nil, let first = records.first {
+            selectedRecordID = first.id
+        }
+    }
+
+    func scanAppleMail() async {
+        guard !isScanning else { return }
+        isScanning = true
+        actionMessage = "Apple Mail faturaları taranıyor…"
+        defer { isScanning = false }
+
+        let result = await LocalCommand.run("/usr/bin/python3", [collectorScript, "scan", "--limit", "60"])
+        loadFromDisk()
+        if result.exitCode == 0 {
+            actionMessage = "Mailler başarıyla tarandı ve yeni fişler kütüğe işlendi."
+        } else {
+            actionMessage = "Mail taraması tamamlandı (\(records.count) fiş kayıtlı)."
+        }
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        actionMessage = nil
+    }
+
+    func parseAndAddText(_ rawText: String) async -> Bool {
+        guard !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        isScanning = true
+        actionMessage = "Metin ayrıştırılıyor…"
+        defer { isScanning = false }
+
+        let result = await LocalCommand.run("/usr/bin/python3", [collectorScript, "parse-text", "--text", rawText])
+        guard result.exitCode == 0,
+              let payload = result.output.data(using: .utf8),
+              let newRecord = try? JSONDecoder().decode(ExpenseRecord.self, from: payload) else {
+            actionMessage = "Fatura metni ayrıştırılamadı."
+            return false
+        }
+
+        records.insert(newRecord, at: 0)
+        selectedRecordID = newRecord.id
+        receiptViewMode = "single"
+        saveCurrentRecords()
+        actionMessage = "Yeni fiş kütüğe başarıyla işlendi: \(newRecord.merchant) (\(newRecord.formattedAmount))"
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        actionMessage = nil
+        return true
+    }
+
+    func addManualExpense(merchant: String, amount: Double, currency: String, category: String, date: String, invoiceNo: String, paymentMethod: String) {
+        let cleanDate = date.isEmpty ? String(ISO8601DateFormatter().string(from: Date()).prefix(10)) : date
+        let tax = currency == "EUR" ? (amount * 0.21 / 1.21) : (currency == "TRY" ? amount * 0.10 : 0.0)
+        let hash = String(abs("\(merchant)\(amount)\(cleanDate)".hashValue), radix: 16).uppercased()
+        let id = "EXP-\(cleanDate.replacingOccurrences(of: "-", with: "").prefix(6))-\(hash.prefix(8))"
+
+        let rec = ExpenseRecord(
+            id: id,
+            date: cleanDate,
+            merchant: merchant,
+            category: category,
+            amount: amount,
+            currency: currency,
+            taxAmount: (tax * 100).rounded() / 100,
+            taxRate: currency == "EUR" ? 21.0 : (currency == "TRY" ? 10.0 : 0.0),
+            paymentMethod: paymentMethod.isEmpty ? "Kart / Manuel Giriş" : paymentMethod,
+            invoiceNumber: invoiceNo.isEmpty ? "MAN-\(hash.prefix(6))" : invoiceNo,
+            status: "Ödendi",
+            source: "Manuel Fiş Girişi",
+            mailMessageId: nil,
+            subject: "\(merchant) Harcaması",
+            items: [ExpenseItem(name: "\(merchant) Hizmet Bedeli", qty: 1, price: amount, currency: currency)],
+            rawSnippet: "Kullanıcı tarafından elle girilen mali fiş.",
+            notes: "Manuel fiş kütüğü kaydı."
+        )
+        records.insert(rec, at: 0)
+        selectedRecordID = rec.id
+        receiptViewMode = "single"
+        saveCurrentRecords()
+        actionMessage = "Manuel fiş başarıyla eklendi."
+    }
+
+    func saveCurrentRecords() {
+        let url = URL(fileURLWithPath: jsonPath)
+        let db = ExpenseDatabase(
+            version: "1.0.0",
+            updated_at: ISO8601DateFormatter().string(from: Date()),
+            currency_rates: ["EUR": 1.0, "USD": 1.08, "TRY": 38.5],
+            stats: stats,
+            expenses: records
+        )
+        if let encoded = try? JSONEncoder().encode(db) {
+            try? encoded.write(to: url)
+        }
+        Task {
+            _ = await LocalCommand.run("/usr/bin/python3", [collectorScript, "list"])
+            loadFromDisk()
+        }
+    }
+
+    func copySlip(for record: ExpenseRecord) {
+        Task {
+            let res = await LocalCommand.run("/usr/bin/python3", [collectorScript, "slip", "--id", record.id])
+            if res.exitCode == 0 {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(res.output, forType: .string)
+                actionMessage = "Fiş termal dökümü panoya kopyalandı."
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                actionMessage = nil
+            }
+        }
+    }
+
+    func copySummarySlip() {
+        Task {
+            let res = await LocalCommand.run("/usr/bin/python3", [collectorScript, "summary-slip"])
+            if res.exitCode == 0 {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(res.output, forType: .string)
+                actionMessage = "Konsolide hesap verme raporu panoya kopyalandı."
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                actionMessage = nil
+            }
+        }
+    }
+}
+
+private struct TornPaperEdge: Shape {
+    let teethCount: Int
+    let teethHeight: CGFloat
+    let isBottom: Bool
+
+    init(teethCount: Int = 28, teethHeight: CGFloat = 6, isBottom: Bool = false) {
+        self.teethCount = teethCount
+        self.teethHeight = teethHeight
+        self.isBottom = isBottom
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let step = rect.width / CGFloat(max(1, teethCount))
+        if isBottom {
+            path.move(to: CGPoint(x: 0, y: 0))
+            path.addLine(to: CGPoint(x: rect.width, y: 0))
+            for i in stride(from: teethCount, through: 0, by: -1) {
+                let x = CGFloat(i) * step
+                let y = (i % 2 == 0) ? teethHeight : 0
+                path.addLine(to: CGPoint(x: x, y: y))
+            }
+        } else {
+            path.move(to: CGPoint(x: 0, y: teethHeight))
+            for i in 0...teethCount {
+                let x = CGFloat(i) * step
+                let y = (i % 2 == 0) ? 0 : teethHeight
+                path.addLine(to: CGPoint(x: x, y: y))
+            }
+            path.addLine(to: CGPoint(x: rect.width, y: rect.height))
+            path.addLine(to: CGPoint(x: 0, y: rect.height))
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct ExpenseThermalSlipCard: View {
+    let record: ExpenseRecord
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 8) {
+                // Top header: date, category pill, invoice pill, status
+                HStack(spacing: 6) {
+                    Text(record.date)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Label(record.category, systemImage: record.categoryIcon)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(record.categoryColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(record.categoryColor.opacity(0.12), in: Capsule())
+
+                    if let inv = record.invoiceNumber, !inv.isEmpty {
+                        Text(inv.prefix(12))
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+
+                // Middle: Merchant title & payment source
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(record.merchant)
+                            .font(.system(size: 13.5, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        if let pay = record.paymentMethod, !pay.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "creditcard.fill")
+                                    .font(.system(size: 9))
+                                Text(pay)
+                                    .font(.system(size: 10, design: .monospaced))
+                            }
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Spacer()
+
+                    // Amount badge
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(record.formattedAmount)
+                            .font(.system(size: 16, weight: .black, design: .rounded))
+                            .foregroundStyle(.primary)
+
+                        if let tax = record.taxAmount, tax > 0 {
+                            Text("KDV: \(record.formattedTax)")
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                // Dotted receipt line separator
+                HStack(spacing: 2) {
+                    ForEach(0..<24, id: \.self) { _ in
+                        Text("-")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(Color.secondary.opacity(0.4))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+
+                // Bottom: Items preview or snippet + Status Stamp
+                HStack {
+                    if let firstItem = record.items?.first {
+                        Text(firstItem.name)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else if let snip = record.rawSnippet, !snip.isEmpty {
+                        Text(snip)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Text("ÖDENDİ")
+                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                        .foregroundStyle(Color.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 3)
+                                .stroke(Color.green.opacity(0.8), lineWidth: 1)
+                        )
+                }
+            }
+            .padding(12)
+            .background(
+                isSelected ? Color.teal.opacity(0.12) : Color.primary.opacity(0.03),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isSelected ? Color.teal : Color.primary.opacity(0.08), lineWidth: isSelected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ThermalReceiptPaperView: View {
+    @ObservedObject var expense: ExpenseMonitor
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Serrated jagged paper top edge
+            TornPaperEdge(teethCount: 26, teethHeight: 6, isBottom: false)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .frame(height: 6)
+
+            // Paper Body
+            VStack(spacing: 12) {
+                // Receipt Header
+                VStack(spacing: 3) {
+                    Text("DAAK NODE FINANCIAL")
+                        .font(.system(size: 12, weight: .black, design: .monospaced))
+                        .tracking(1.5)
+                    Text("RESMİ MALİYE & GİDER KÜTÜĞÜ")
+                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text("LOLILE-M3 · GRANADA / İSTANBUL")
+                        .font(.system(size: 8.5, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.top, 10)
+
+                // Dotted tear line
+                HStack(spacing: 2) {
+                    ForEach(0..<22, id: \.self) { _ in
+                        Text("- ")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary.opacity(0.5))
+                    }
+                }
+
+                // Mode Selector: [ Aylık İcmal | Seçili Fiş ]
+                Picker("", selection: $expense.receiptViewMode) {
+                    Text("Aylık İcmal (Hesap Ver)").tag("summary")
+                    Text("Seçili Fiş").tag("single")
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+
+                if expense.receiptViewMode == "summary" {
+                    summarySlipContent
+                } else {
+                    singleSlipContent
+                }
+
+                Spacer(minLength: 8)
+
+                // Paper Footer
+                VStack(spacing: 4) {
+                    HStack(spacing: 2) {
+                        ForEach(0..<22, id: \.self) { _ in
+                            Text("- ")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary.opacity(0.5))
+                        }
+                    }
+
+                    Text("*** MALİ MUHASEBE ARŞİV KOPYASI ***")
+                        .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text("DAAKNODE v2.22 · RM-OS PERSIST")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.bottom, 8)
+            }
+            .padding(.horizontal, 16)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            // Serrated jagged paper bottom edge
+            TornPaperEdge(teethCount: 26, teethHeight: 6, isBottom: true)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .frame(height: 6)
+        }
+        .frame(width: 380)
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 4)
+    }
+
+    @ViewBuilder
+    private var summarySlipContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("HESAP VERME & İCMAL")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                Spacer()
+                Text("\(expense.records.count) FİŞ")
+                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                    .foregroundStyle(.teal)
+            }
+
+            Divider()
+
+            // Large Net Cash Out Total
+            VStack(alignment: .leading, spacing: 2) {
+                Text("TOPLAM NAKİT ÇIKIŞI (EUR EQUIV)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                let eurTotal = expense.stats?.total_eur_equivalent ?? 0.0
+                Text(String(format: "€%.2f", eurTotal))
+                    .font(.system(size: 26, weight: .heavy, design: .rounded))
+                    .foregroundStyle(.primary)
+
+                if let taxEur = expense.stats?.total_tax_eur_equivalent, taxEur > 0 {
+                    Text(String(format: "Ödenen KDV / IVA Dahil: €%.2f", taxEur))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+
+            // Currency Breakdown Table
+            VStack(alignment: .leading, spacing: 4) {
+                Text("PARA BİRİMLERİ:")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+
+                if let currs = expense.stats?.by_currency {
+                    ForEach(Array(currs.keys.sorted()), id: \.self) { c in
+                        let val = currs[c] ?? 0.0
+                        let sym = c == "EUR" ? "€" : (c == "USD" ? "$" : (c == "TRY" ? "₺" : c))
+                        HStack {
+                            Text("· \(c)")
+                                .font(.system(size: 11, design: .monospaced))
+                            Spacer()
+                            Text(String(format: "%@%.2f", sym, val))
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            // Top Category breakdown
+            VStack(alignment: .leading, spacing: 6) {
+                Text("KATEGORİ DAĞILIMI:")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+
+                if let cats = expense.stats?.by_category_eur {
+                    let total = max(1.0, expense.stats?.total_eur_equivalent ?? 1.0)
+                    ForEach(Array(cats.keys.sorted(by: { (cats[$0] ?? 0) > (cats[$1] ?? 0) })).prefix(5), id: \.self) { cat in
+                        let amt = cats[cat] ?? 0.0
+                        let ratio = min(1.0, amt / total)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(cat)
+                                    .font(.system(size: 10.5))
+                                Spacer()
+                                Text(String(format: "€%.2f", amt))
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            }
+                            GeometryReader { geo in
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.primary.opacity(0.08))
+                                        .frame(height: 4)
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.teal)
+                                        .frame(width: geo.size.width * CGFloat(ratio), height: 4)
+                                }
+                            }
+                            .frame(height: 4)
+                        }
+                    }
+                }
+            }
+
+            // Authentic Slanted Rubber Stamp
+            HStack {
+                Spacer()
+                Text("✔ HESAP VERİLDİ / MUTABIK")
+                    .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                    .foregroundStyle(Color.green)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.green.opacity(0.8), lineWidth: 1.5)
+                    )
+                    .rotationEffect(.degrees(-6))
+                    .padding(.vertical, 6)
+                Spacer()
+            }
+
+            // Action: Copy summary slip
+            Button {
+                expense.copySummarySlip()
+            } label: {
+                Label("İcmal Fişini Panoya Kopyala", systemImage: "doc.on.doc.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    private var singleSlipContent: some View {
+        if let rec = expense.selectedRecord {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("FİŞ NO: \(rec.id.prefix(14))")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    Spacer()
+                    Text(rec.date)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                if let inv = rec.invoiceNumber, !inv.isEmpty {
+                    Text("BELGE NO: \(inv)")
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("TEDARİKÇİ:")
+                        .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(rec.merchant)
+                        .font(.system(size: 13, weight: .bold))
+                }
+
+                if let pay = rec.paymentMethod {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("ÖDEME KANALI:")
+                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text(pay)
+                            .font(.system(size: 10.5, design: .monospaced))
+                    }
+                }
+
+                Divider()
+
+                // Line items
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("ÜRÜN / HİZMET")
+                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("TUTAR")
+                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let items = rec.items, !items.isEmpty {
+                        ForEach(items) { it in
+                            HStack {
+                                Text("\(it.qty)x \(it.name)")
+                                    .font(.system(size: 10.5))
+                                    .lineLimit(2)
+                                Spacer()
+                                Text(String(format: "%@%.2f", rec.symbol, it.price))
+                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                            }
+                        }
+                    } else {
+                        HStack {
+                            Text(rec.merchant)
+                                .font(.system(size: 10.5))
+                            Spacer()
+                            Text(rec.formattedAmount)
+                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Subtotal, Tax, Gross Total
+                VStack(spacing: 3) {
+                    HStack {
+                        Text("Ara Toplam (Net):")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(rec.formattedSubtotal)
+                            .font(.system(size: 10.5, design: .monospaced))
+                    }
+
+                    if let tax = rec.taxAmount, tax > 0 {
+                        HStack {
+                            Text("KDV / IVA (%21):")
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(rec.formattedTax)
+                                .font(.system(size: 10.5, design: .monospaced))
+                        }
+                    }
+
+                    HStack {
+                        Text("TOPLAM ÖDENEN:")
+                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                        Spacer()
+                        Text(rec.formattedAmount)
+                            .font(.system(size: 14, weight: .black, design: .monospaced))
+                    }
+                }
+                .padding(8)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+
+                // Stamp
+                HStack {
+                    Spacer()
+                    Text("✔ ÖDENDİ")
+                        .font(.system(size: 10.5, weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.green)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.green.opacity(0.8), lineWidth: 1.5)
+                        )
+                        .rotationEffect(.degrees(-5))
+                    Spacer()
+                }
+
+                // Copy single slip button
+                Button {
+                    expense.copySlip(for: rec)
+                } label: {
+                    Label("Termal Fişi Kopyala", systemImage: "doc.on.doc.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        } else {
+            Text("İncelemek için soldan bir fiş seçin.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 30)
+        }
+    }
+}
+
+private struct ExpensePasteModalView: View {
+    @ObservedObject var expense: ExpenseMonitor
+    @State private var textInput: String = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Metin & E-posta Yapıştırıp Fişle", systemImage: "doc.text.viewfinder")
+                    .font(.headline)
+                    .foregroundStyle(.teal)
+                Spacer()
+                Button("Kapat") {
+                    expense.showPasteModal = false
+                }
+                .controlSize(.small)
+            }
+
+            Text("Gelen e-posta metnini, fatura özetini veya sipariş teyidini buraya yapıştırın. Yapay zeka & regex motoru tutar, para birimi, vergi, firma ve kalemleri otomatik ayrıştıracaktır.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $textInput)
+                .font(.system(size: 12, design: .monospaced))
+                .frame(height: 180)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.15), lineWidth: 1))
+
+            HStack {
+                Button("Temizle") {
+                    textInput = ""
+                }
+                .controlSize(.small)
+
+                Spacer()
+
+                Button {
+                    Task {
+                        let success = await expense.parseAndAddText(textInput)
+                        if success {
+                            expense.showPasteModal = false
+                        }
+                    }
+                } label: {
+                    Label("Ayrıştır & Fiş Kütüğüne Ekle", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+                .controlSize(.small)
+                .disabled(textInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || expense.isScanning)
+            }
+        }
+        .padding(20)
+        .frame(width: 520, height: 340)
+    }
+}
+
+private struct ExpenseAddManualModalView: View {
+    @ObservedObject var expense: ExpenseMonitor
+    @State private var merchant = ""
+    @State private var amountText = ""
+    @State private var currency = "EUR"
+    @State private var category = "Yazılım & AI"
+    @State private var invoiceNo = ""
+    @State private var paymentMethod = "Mastercard •••• 4433"
+    @State private var date = ""
+
+    private let categories = [
+        "Yazılım & AI",
+        "Altyapı & Sunucu",
+        "Araç & Yakıt (RM Garage)",
+        "Ofis, Kira & Yaşam",
+        "İletişim & Donanım",
+        "Kamu, Vergi & Sosyal Güvenlik",
+        "Genel Gider"
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Manuel Harcama & Fiş Girişi", systemImage: "plus.circle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.teal)
+                Spacer()
+                Button("Kapat") {
+                    expense.showAddModal = false
+                }
+                .controlSize(.small)
+            }
+
+            VStack(spacing: 10) {
+                TextField("Tedarikçi / Firma (Örn: Apple, OpenAI, Solred)", text: $merchant)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack(spacing: 8) {
+                    TextField("Tutar (Örn: 23.00)", text: $amountText)
+                        .textFieldStyle(.roundedBorder)
+
+                    Picker("Birim", selection: $currency) {
+                        Text("EUR (€)").tag("EUR")
+                        Text("TRY (₺)").tag("TRY")
+                        Text("USD ($)").tag("USD")
+                    }
+                    .frame(width: 120)
+                }
+
+                Picker("Kategori", selection: $category) {
+                    ForEach(categories, id: \.self) { c in
+                        Text(c).tag(c)
+                    }
+                }
+
+                TextField("Fatura / Belge No (İsteğe Bağlı)", text: $invoiceNo)
+                    .textFieldStyle(.roundedBorder)
+
+                TextField("Ödeme Kanalı (Örn: Wise •••• 4783)", text: $paymentMethod)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                Spacer()
+                Button {
+                    if let amt = Double(amountText.replacingOccurrences(of: ",", with: ".")), !merchant.isEmpty {
+                        expense.addManualExpense(
+                            merchant: merchant,
+                            amount: amt,
+                            currency: currency,
+                            category: category,
+                            date: date,
+                            invoiceNo: invoiceNo,
+                            paymentMethod: paymentMethod
+                        )
+                        expense.showAddModal = false
+                    }
+                } label: {
+                    Text("Fişi Kaydet")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+                .controlSize(.small)
+                .disabled(merchant.isEmpty || amountText.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440, height: 320)
+    }
+}
+
+private struct ExpenseCommandCenterView: View {
+    @EnvironmentObject private var expense: ExpenseMonitor
+
+    private let categoryChips = [
+        "Tümü",
+        "Yazılım & AI",
+        "Altyapı",
+        "Garage",
+        "Ofis",
+        "İletişim",
+        "Vergi"
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Top Toolbar: Search, Filters, Live Scan & Paste buttons
+            topActionBar
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            // Main Dual-Pane Content
+            HStack(spacing: 0) {
+                // Left: Filterable Expense Receipts List
+                VStack(spacing: 0) {
+                    filterBar
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.primary.opacity(0.02))
+
+                    Divider()
+
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(expense.filteredRecords) { rec in
+                                ExpenseThermalSlipCard(
+                                    record: rec,
+                                    isSelected: expense.selectedRecordID == rec.id
+                                ) {
+                                    expense.selectedRecordID = rec.id
+                                    expense.receiptViewMode = "single"
+                                }
+                            }
+                        }
+                        .padding(16)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+
+                Divider()
+
+                // Right: The Physical Thermal Receipt Paper Tape View
+                ScrollView {
+                    ThermalReceiptPaperView(expense: expense)
+                        .padding(.vertical, 20)
+                        .padding(.horizontal, 16)
+                }
+                .frame(width: 420)
+                .background(Color.primary.opacity(0.03))
+            }
+        }
+        .sheet(isPresented: $expense.showPasteModal) {
+            ExpensePasteModalView(expense: expense)
+        }
+        .sheet(isPresented: $expense.showAddModal) {
+            ExpenseAddManualModalView(expense: expense)
+        }
+    }
+
+    private var topActionBar: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 8) {
+                    Image(systemName: "receipt.fill")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.teal)
+                    Text("MALİYE & FİŞ KÜTÜĞÜ")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                    Text("· \(expense.records.count) FİŞ")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Text("E-postalardan, faturalardan ve banka dekontlarından otomatik çıkarılan mali harcama arşivi")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            // Action Buttons
+            HStack(spacing: 8) {
+                Button {
+                    Task { await expense.scanAppleMail() }
+                } label: {
+                    HStack(spacing: 5) {
+                        if expense.isScanning {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "envelope.badge.shield.half.filled")
+                        }
+                        Text(expense.isScanning ? "Taranıyor…" : "Mailleri Canlı Tara")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+                .controlSize(.small)
+                .disabled(expense.isScanning)
+
+                Button {
+                    expense.showPasteModal = true
+                } label: {
+                    Label("Metin Yapıştır", systemImage: "doc.text.viewfinder")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    expense.showAddModal = true
+                } label: {
+                    Label("Manuel Fiş", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    expense.copySummarySlip()
+                } label: {
+                    Label("İcmal Fişi", systemImage: "newspaper.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 10) {
+            // Search field
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Tedarikçi, fatura no, hizmet ara…", text: $expense.searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                if !expense.searchText.isEmpty {
+                    Button {
+                        expense.searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            .frame(maxWidth: 240)
+
+            Spacer()
+
+            // Currency pills
+            HStack(spacing: 4) {
+                ForEach(["Tümü", "EUR", "USD", "TRY"], id: \.self) { curr in
+                    let isSel = expense.selectedCurrency == curr
+                    Button {
+                        expense.selectedCurrency = curr
+                    } label: {
+                        Text(curr == "EUR" ? "€ EUR" : (curr == "USD" ? "$ USD" : (curr == "TRY" ? "₺ TRY" : curr)))
+                            .font(.system(size: 10, weight: isSel ? .bold : .medium))
+                            .foregroundStyle(isSel ? Color.white : Color.primary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(isSel ? Color.teal : Color.primary.opacity(0.05), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+
 private extension ShapeStyle where Self == Color {
     static var amberHue: Color {
         Color(red: 0.96, green: 0.68, blue: 0.14)
     }
 }
 
+
 private enum CommandCenterTab: String, CaseIterable, Identifiable {
     case dashboard = "Kontrol Paneli"
+    case expenses = "Maliye & Fiş Kütüğü"
     case outreach = "Otonom Boru Hattı"
     case hunter = "Fırsat & Müşteri Avcısı"
     case opportunities = "Kamu & İhale İstihbaratı"
@@ -7303,6 +8429,7 @@ private enum CommandCenterTab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .dashboard: return "square.grid.2x2.fill"
+        case .expenses: return "receipt.fill"
         case .outreach: return "envelope.badge.shield.half.filled"
         case .hunter: return "target"
         case .opportunities: return "sparkles.rectangle.stack.fill"
@@ -7397,6 +8524,7 @@ private struct DAAKCommandCenterView: View {
     @EnvironmentObject private var broadcast: BroadcastMonitor
     @EnvironmentObject private var smartHome: SmartHomeMonitor
     @EnvironmentObject private var study: UniversityStudyMonitor
+    @EnvironmentObject private var expense: ExpenseMonitor
 
     @State private var selectedTab: CommandCenterTab = .dashboard
     @State private var sidebarCollapsed = false
@@ -7462,6 +8590,8 @@ private struct DAAKCommandCenterView: View {
                     switch selectedTab {
                     case .dashboard:
                         studioExecutiveDashboard
+                    case .expenses:
+                        ExpenseCommandCenterView()
                     case .outreach:
                         studioOutreachPipelineView
                     case .hunter:
@@ -7561,7 +8691,7 @@ private struct DAAKCommandCenterView: View {
                         Text("DAAK NODE")
                             .font(.system(size: 14, weight: .heavy, design: .rounded))
                             .tracking(0.5)
-                        Text("KONTROL MERKEZİ · v2.21.0")
+                        Text("KONTROL MERKEZİ · v2.22.0")
                             .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
@@ -7577,8 +8707,13 @@ private struct DAAKCommandCenterView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     sidebarNavSection(
-                        title: "YÖNETİM",
+                        title: "YÖNETİM & GELİR",
                         tabs: [.dashboard, .outreach, .hunter, .opportunities]
+                    )
+
+                    sidebarNavSection(
+                        title: "MALİYE & FİŞ",
+                        tabs: [.expenses]
                     )
 
                     sidebarNavSection(
@@ -7700,6 +8835,9 @@ private struct DAAKCommandCenterView: View {
 
     private func sidebarBadge(for tab: CommandCenterTab) -> (text: String, color: Color)? {
         switch tab {
+        case .expenses:
+            let count = expense.records.count
+            return count > 0 ? ("\(count)", .teal) : nil
         case .outreach:
             let verifiedCount = opportunity.cashHunterLeads.filter { $0.hasVerifiedEmail }.count
             return (verifiedCount > 0 ? "\(verifiedCount)" : "25", .indigo)
@@ -10379,6 +11517,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
     private let broadcast = BroadcastMonitor()
     private let smartHome = SmartHomeMonitor()
     private let study = UniversityStudyMonitor()
+    private let expense = ExpenseMonitor()
 
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
@@ -10402,6 +11541,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(broadcast)
             .environmentObject(smartHome)
             .environmentObject(study)
+            .environmentObject(expense)
 
         popover.behavior = .transient
         popover.animates = true
@@ -10456,6 +11596,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(broadcast)
             .environmentObject(smartHome)
             .environmentObject(study)
+            .environmentObject(expense)
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1360, height: 860),
