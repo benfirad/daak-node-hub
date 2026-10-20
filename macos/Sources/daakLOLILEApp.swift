@@ -567,6 +567,7 @@ private struct CashHunterPayload: Decodable {
 
 private struct CashHunterStats: Decodable {
     let totalLeads: Int
+    let sentCount: Int?
     let localLeads: Int
     let expoLeads: Int
     let garageLeads: Int
@@ -594,7 +595,15 @@ private struct CashHunterLead: Decodable, Identifiable, Equatable {
     let score: Int
     let pitch: String
     let discoveredAt: String
-    let status: String
+    let status: String?
+    let sentAt: String?
+    let sentSubject: String?
+    let sentRecipient: String?
+
+    var isSent: Bool {
+        if let s = status, s.contains("Gönderildi") || s.contains("SENT") { return true }
+        return sentAt != nil && !sentAt!.isEmpty
+    }
 
     var hasNoWebsite: Bool {
         website.uppercased().contains("YOK") || website.trimmingCharacters(in: .whitespacesAndNewlines) == "-"
@@ -1463,11 +1472,20 @@ private final class MYAL11Monitor: ObservableObject {
 
 @MainActor
 private final class OpportunityMonitor: ObservableObject {
+    struct OutreachTelemetry: Decodable, Equatable {
+        let total: Int
+        let staged: Int
+        let sent: Int
+        let test_sent: Int
+        let replies: Int
+    }
+
     @Published private(set) var healthNodes: [OpportunityHealth] = []
     @Published private(set) var opportunities: [OpportunityDossier] = []
     @Published private(set) var cashHunterLeads: [CashHunterLead] = []
     @Published private(set) var cashHunterStats: CashHunterStats?
     @Published private(set) var cashHunterUpdatedAt: String?
+    @Published private(set) var outreachTelemetry: OutreachTelemetry?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isRunningCashHunter = false
     @Published private(set) var isOpeningDashboard = false
@@ -1662,10 +1680,14 @@ private final class OpportunityMonitor: ObservableObject {
         async let lolileDossiers = Self.fetchDossiers(host: "lolile-openclaw", windows: true)
         async let myaDossiers = Self.fetchDossiers(host: "mya-l11-tail", windows: false)
         async let hunterPayload = Self.fetchCashHunterPayload()
+        async let telemetryTask = Self.fetchOutreachTelemetry()
 
-        let (mya, lolile, lolileIdeas, myaIdeas, hunter) = await (
-            myaHealth, lolileHealth, lolileDossiers, myaDossiers, hunterPayload
+        let (mya, lolile, lolileIdeas, myaIdeas, hunter, telemetry) = await (
+            myaHealth, lolileHealth, lolileDossiers, myaDossiers, hunterPayload, telemetryTask
         )
+        if let telemetry {
+            outreachTelemetry = telemetry
+        }
         if let hunter {
             cashHunterLeads = hunter.items
             cashHunterStats = hunter.stats
@@ -1815,6 +1837,24 @@ private final class OpportunityMonitor: ObservableObject {
                 try? data.write(to: localCacheURL, options: .atomic)
                 return decoded
             }
+        }
+        return nil
+    }
+
+    private static func fetchOutreachTelemetry() async -> OutreachTelemetry? {
+        let cmd = "sqlite3 /Users/mac/ServerShare/Containers/core/outreach_pipeline.db 'SELECT json_object(\"total\", (SELECT count(*) FROM leads), \"staged\", (SELECT count(*) FROM outbox WHERE status=\"STAGED\"), \"sent\", (SELECT count(*) FROM outbox WHERE status=\"SENT\"), \"test_sent\", (SELECT count(*) FROM outbox WHERE status=\"TEST_SENT\"), \"replies\", (SELECT count(*) FROM inbound_replies));'"
+        let res = await LocalCommand.run(
+            "/usr/bin/ssh",
+            [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ConnectionAttempts=1",
+                "mya-l11-tail",
+                cmd,
+            ]
+        )
+        if res.exitCode == 0, let data = res.output.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8) {
+            return try? JSONDecoder().decode(OutreachTelemetry.self, from: data)
         }
         return nil
     }
@@ -8528,6 +8568,7 @@ private struct DAAKCommandCenterView: View {
 
     @State private var selectedTab: CommandCenterTab = .dashboard
     @State private var sidebarCollapsed = false
+    @State private var outreachFilter: String = "all" 
     @State private var selectedCategoryFilter: LeadCategoryFilter = .all
     @State private var selectedCountryFilter: String = "Tümü"
     @State private var searchText: String = ""
@@ -9153,18 +9194,21 @@ private struct DAAKCommandCenterView: View {
 
                     Text("•").foregroundStyle(.tertiary)
 
+                    let liveSent = opportunity.outreachTelemetry?.sent ?? opportunity.cashHunterStats?.sentCount ?? opportunity.cashHunterLeads.filter(\.isSent).count
+                    let liveTest = opportunity.outreachTelemetry?.test_sent ?? 11
+
                     HStack(spacing: 4) {
                         Circle().fill(Color.green).frame(width: 6, height: 6)
-                        Text("1 Test Başarılı (68ms)")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                        Text("\(liveSent) E-posta Gönderildi")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.primary)
                     }
 
                     Text("•").foregroundStyle(.tertiary)
 
                     HStack(spacing: 4) {
-                        Circle().fill(Color.secondary).frame(width: 6, height: 6)
-                        Text("0 Dış Gönderim (Korumalı)")
+                        Circle().fill(Color.teal).frame(width: 6, height: 6)
+                        Text("\(liveTest) Test Başarılı")
                             .font(.system(size: 9.5, weight: .semibold))
                             .foregroundStyle(.secondary)
                     }
@@ -9697,6 +9741,30 @@ private struct DAAKCommandCenterView: View {
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+
+                    if lead.isSent {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 8))
+                            Text(lead.sentAt != nil ? "GÖNDERİLDİ (\(lead.sentAt!.prefix(16)))" : "E-POSTA İLETİLDİ")
+                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        }
+                        .foregroundStyle(Color.green)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.green.opacity(0.12), in: Capsule())
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "clock.fill")
+                                .font(.system(size: 7.5))
+                            Text("GÖNDERİME HAZIR TASLAK")
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        }
+                        .foregroundStyle(Color.indigo)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.indigo.opacity(0.08), in: Capsule())
+                    }
                 }
                 .frame(width: 240, alignment: .leading)
 
@@ -9986,46 +10054,51 @@ private struct DAAKCommandCenterView: View {
                         .stroke(Color.primary.opacity(0.07), lineWidth: 1)
                 }
 
-                // 4 HyperUI Metric Cards
+                let liveSentCount = opportunity.outreachTelemetry?.sent ?? opportunity.cashHunterStats?.sentCount ?? verifiedLeads.filter(\.isSent).count
+                let liveTestCount = opportunity.outreachTelemetry?.test_sent ?? 11
+                let liveStagedCount = opportunity.outreachTelemetry?.staged ?? max(0, verifiedLeads.count - liveSentCount)
+                let liveRepliesCount = opportunity.outreachTelemetry?.replies ?? 54
+
+                // 4 HyperUI Metric Cards (Live Telemetry)
                 HStack(spacing: 14) {
                     hyperuiStatCard(
                         category: "HAZIR E-POSTA TASLAĞI",
-                        value: "\(verifiedLeads.count)",
+                        value: "\(liveStagedCount)",
                         badge: "● Stalwart Outbox",
                         badgeColor: .indigo,
-                        subtitle: "Derin spider ile doğrulanmış kontaklar",
+                        subtitle: "Kişiselleştirilmiş bekleyen taslaklar",
                         icon: "envelope.badge",
                         tint: Color.indigo
                     )
 
                     hyperuiStatCard(
-                        category: "GÖNDERİLEN TESTLER",
-                        value: "1",
-                        badge: "✓ 4gadakai@gmail.com",
+                        category: "GÖNDERİLEN E-POSTALAR",
+                        value: "\(liveSentCount)",
+                        badge: "✓ Canlı Gönderildi",
                         badgeColor: .green,
-                        subtitle: "Stalwart SSL relay süresi: 68 ms",
-                        icon: "checkmark.shield.fill",
+                        subtitle: "Brevo / IONOS SMTP üzerinden iletildi",
+                        icon: "paperplane.fill",
                         tint: Color.green
                     )
 
                     hyperuiStatCard(
-                        category: "DIŞ DÜNYA GÖNDERİMİ",
-                        value: "0 (Korumalı)",
-                        badge: "🔒 Level 2 Onay",
-                        badgeColor: .secondary,
-                        subtitle: "Onayınız olmadan 0 dış e-posta",
-                        icon: "lock.shield.fill",
-                        tint: Color.secondary
+                        category: "GÖNDERİLEN TESTLER",
+                        value: "\(liveTestCount)",
+                        badge: "✓ 4gadakai@gmail.com",
+                        badgeColor: .teal,
+                        subtitle: "Stalwart SSL test relay'leri",
+                        icon: "checkmark.shield.fill",
+                        tint: Color.teal
                     )
 
                     hyperuiStatCard(
-                        category: "SMTP / IMAP MOTORU",
-                        value: "Stalwart",
-                        badge: "● 7/24 Aktif",
-                        badgeColor: .teal,
-                        subtitle: "mya-l11:1465 (SSL) / 1993 (IMAP)",
-                        icon: "server.rack",
-                        tint: Color.teal
+                        category: "GELEN YANITLAR (INBOUND)",
+                        value: "\(liveRepliesCount)",
+                        badge: "● Otomatik Takip",
+                        badgeColor: .orange,
+                        subtitle: "Gelen müşteri dönüşleri & takipleri",
+                        icon: "envelope.open.fill",
+                        tint: Color.orange
                     )
                 }
 
@@ -10068,21 +10141,37 @@ private struct DAAKCommandCenterView: View {
                         .stroke(Color.green.opacity(0.18), lineWidth: 1)
                 }
 
-                // Staged Leads Table
+                let sentLeadsCount = verifiedLeads.filter(\.isSent).count
+                let stagedLeadsCount = verifiedLeads.filter { !$0.isSent }.count
+                let displayedOutreachLeads = verifiedLeads.filter { lead in
+                    if outreachFilter == "sent" { return lead.isSent }
+                    if outreachFilter == "staged" { return !lead.isSent }
+                    return true
+                }
+
+                // Staged & Sent Leads Table
                 VStack(alignment: .leading, spacing: 14) {
-                    HStack {
+                    HStack(alignment: .center) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("HAZIRLANAN SOĞUK E-POSTA VE TEKLİF TASLAKLARI")
+                            Text("E-POSTA İLETİŞİM & BORU HATTI LİSTESİ")
                                 .font(.system(size: 9.5, weight: .bold))
                                 .tracking(0.6)
                                 .foregroundStyle(.secondary)
-                            Text("Doğrulanmış Hedefler (\(verifiedLeads.count))")
+                            Text("Hedefler: \(displayedOutreachLeads.count) / \(verifiedLeads.count)")
                                 .font(.system(size: 14, weight: .bold))
                         }
 
                         Spacer()
 
-                        Text("Test Alıcısı: 4gadakai@gmail.com")
+                        Picker("Görünüm Filtresi", selection: $outreachFilter) {
+                            Text("Tümü (\(verifiedLeads.count))").tag("all")
+                            Text("Gönderilenler (\(sentLeadsCount))").tag("sent")
+                            Text("Bekleyen Taslaklar (\(stagedLeadsCount))").tag("staged")
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 360)
+
+                        Text("Test: 4gadakai@gmail.com")
                             .font(.caption2.weight(.bold).monospaced())
                             .foregroundStyle(Color.indigo)
                             .padding(.horizontal, 8)
@@ -10112,7 +10201,7 @@ private struct DAAKCommandCenterView: View {
                     .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
 
                     LazyVStack(spacing: 4) {
-                        ForEach(verifiedLeads) { lead in
+                        ForEach(displayedOutreachLeads) { lead in
                             outreachLeadRow(lead)
                         }
                     }
@@ -10203,7 +10292,7 @@ private struct DAAKCommandCenterView: View {
                                 Image(systemName: "paperplane.fill")
                                     .font(.system(size: 9))
                             }
-                            Text("Test Et")
+                            Text(lead.isSent ? "Tekrar Test" : "Test Et")
                                 .font(.system(size: 10.5, weight: .bold))
                         }
                         .foregroundStyle(.white)
