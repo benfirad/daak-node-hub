@@ -7931,7 +7931,7 @@ private struct ThermalReceiptPaperView: View {
                     Text("*** MALİ MUHASEBE ARŞİV KOPYASI ***")
                         .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    Text("DAAKNODE v2.22 · RM-OS PERSIST")
+                    Text("DAAKNODE v2.23 · RM-OS PERSIST")
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
@@ -8843,7 +8843,7 @@ private struct DAAKCommandCenterView: View {
                         Text("DAAK NODE")
                             .font(.system(size: 14, weight: .heavy, design: .rounded))
                             .tracking(0.5)
-                        Text("KONTROL MERKEZİ · v2.22.0")
+                        Text("KONTROL MERKEZİ · v2.23.0")
                             .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
