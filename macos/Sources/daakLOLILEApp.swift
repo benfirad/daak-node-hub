@@ -254,6 +254,7 @@ private struct NodeDeviceHealth: Decodable, Sendable {
     let batteryTemperatureC: Double?
     let cpuTemperatureC: Double?
     let memoryFreePercent: Int?
+    let powerWatts: Double?
     let powerLabel: String?
 }
 
@@ -262,6 +263,7 @@ private struct LocalMacHealth: Decodable, Sendable {
     let batteryTemperatureC: Double?
     let cpuTemperatureC: Double?
     let memoryFreePercent: Int?
+    let powerWatts: Double?
     let powerLabel: String
 }
 
@@ -304,6 +306,7 @@ private struct MYAL11Status: Decodable {
     let cpuUsagePercent: Double?
     let cpuTemperatureC: Double?
     let gpuTemperatureC: Double?
+    let systemWatts: Double?
     let diskUsedPercent: Double?
     let services: Services
 
@@ -331,6 +334,7 @@ private struct MYAL11Status: Decodable {
         case cpuUsagePercent
         case cpuTemperatureC
         case gpuTemperatureC
+        case systemWatts
         case diskUsedPercent
         case services
     }
@@ -1062,6 +1066,8 @@ private final class MYAL11Monitor: ObservableObject {
         var parts = [connectionSummary]
         if let cpu = status?.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", cpu)) }
         if let gpu = status?.gpuTemperatureC { parts.append(String(format: "GPU %.0f°C", gpu)) }
+        if let ram = status?.memoryFreePercent { parts.append("Boş RAM %\(ram)") }
+        if let watts = status?.systemWatts, watts > 0 { parts.append(String(format: "%.0f W", watts)) }
         if isOnBattery, let battery = status?.batteryPercent { parts.append("Pilde %\(battery)") }
         return parts.joined(separator: " · ")
     }
@@ -2045,6 +2051,8 @@ private final class NodeMonitor: ObservableObject {
         if let value = deviceHealth?.batteryPercent { parts.append("Pil %\(value)") }
         if let value = deviceHealth?.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", value)) }
         if let value = deviceHealth?.batteryTemperatureC { parts.append(String(format: "Pil %.0f°C", value)) }
+        if let value = deviceHealth?.memoryFreePercent { parts.append("Boş RAM %\(value)") }
+        if let value = deviceHealth?.powerWatts { parts.append(String(format: "%.1f W", value)) }
         return parts.isEmpty ? stateLabel : parts.joined(separator: " · ")
     }
 
@@ -2121,7 +2129,8 @@ private final class NodeMonitor: ObservableObject {
         async let batteryResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "dumpsys", "battery"])
         async let thermalResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "dumpsys", "thermalservice"])
         async let memoryResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "cat", "/proc/meminfo"])
-        let (battery, thermal, memory) = await (batteryResult, thermalResult, memoryResult)
+        async let currentResult = LocalCommand.run("/opt/homebrew/bin/adb", ["-s", serial, "shell", "cat", "/sys/class/power_supply/battery/current_now"])
+        let (battery, thermal, memory, current) = await (batteryResult, thermalResult, memoryResult, currentResult)
         guard battery.exitCode == 0 else {
             deviceHealth = nil
             return
@@ -2138,11 +2147,17 @@ private final class NodeMonitor: ObservableObject {
         let memoryFree = total.flatMap { total in available.map { Int(($0 * 100 / total).rounded()) } }
         let power = battery.output.contains("AC powered: true") ? "AC" :
             (battery.output.contains("USB powered: true") ? "USB" : "UNPLUGGED")
+        let voltageMV = Self.firstNumber(in: battery.output, pattern: #"(?m)^\s*voltage:\s*(\d+)\s*$"#)
+        let currentRaw = Double(current.output.trimmingCharacters(in: .whitespacesAndNewlines))
+        // Samsung max77705 reports mA; generic kernels report µA. Normalise to mA.
+        let currentMA = currentRaw.map { abs($0) > 20_000 ? abs($0) / 1000 : abs($0) }
+        let watts = voltageMV.flatMap { v in currentMA.map { $0 * v / 1_000_000 } }
         deviceHealth = NodeDeviceHealth(
             batteryPercent: level,
             batteryTemperatureC: batteryTemperature,
             cpuTemperatureC: cpuTemperature,
             memoryFreePercent: memoryFree,
+            powerWatts: watts,
             powerLabel: power
         )
     }
@@ -2710,6 +2725,14 @@ private final class RelayMonitor: ObservableObject {
         return String(format: "%.0f°C", value)
     }
 
+    static func formatCpuSummary(load: Double?, temp: Double?) -> String {
+        let loadStr = formatPercent(load)
+        if let temp {
+            return "\(loadStr) · \(formatTemperature(temp))"
+        }
+        return loadStr
+    }
+
     static func formatPower(_ value: Double?, estimated: Bool = false) -> String {
         guard let value else { return "—" }
         return String(format: "%.0f W%@", value, estimated ? " tah." : "")
@@ -2838,12 +2861,14 @@ private final class LocalMacMonitor: ObservableObject {
         smc='/Applications/Stats.app/Contents/Resources/smc'
         cpu=null
         btemp=null
+        watts=null
         if [[ -x "$smc" ]]; then
           temps=$("$smc" list -t 2>/dev/null)
           cpu=$(printf '%s\n' "$temps" | awk '$1=="[TCHP]" {print $2; exit}')
           btemp=$(printf '%s\n' "$temps" | awk '$1=="[TB0T]" {print $2; exit}')
+          watts=$("$smc" list -p 2>/dev/null | awk '$1=="[PSTR]" {printf "%.1f", $2; exit}')
         fi
-        printf '{"batteryPercent":%s,"batteryTemperatureC":%s,"cpuTemperatureC":%s,"memoryFreePercent":%s,"powerLabel":"%s"}\n' "${level:-null}" "${btemp:-null}" "${cpu:-null}" "${mem:-null}" "$power"
+        printf '{"batteryPercent":%s,"batteryTemperatureC":%s,"cpuTemperatureC":%s,"memoryFreePercent":%s,"powerWatts":%s,"powerLabel":"%s"}\n' "${level:-null}" "${btemp:-null}" "${cpu:-null}" "${mem:-null}" "${watts:-null}" "$power"
         """#
         let result = await LocalCommand.run("/bin/zsh", ["-c", script])
         guard result.exitCode == 0,
@@ -2857,6 +2882,8 @@ private final class LocalMacMonitor: ObservableObject {
         var parts = [health.powerLabel]
         if let value = health.batteryPercent { parts.append("Pil %\(value)") }
         if let value = health.cpuTemperatureC { parts.append(String(format: "CPU %.0f°C", value)) }
+        if let value = health.memoryFreePercent { parts.append("Boş RAM %\(value)") }
+        if let value = health.powerWatts { parts.append(String(format: "%.0f W", value)) }
         return parts.joined(separator: " · ")
     }
 }
@@ -3860,7 +3887,7 @@ private struct DeviceOverviewView: View {
                     symbol: "desktopcomputer",
                     online: relay.isConnected,
                     status: relay.status?.hardware?.available == true
-                        ? "CPU \(RelayMonitor.formatTemperature(relay.status?.hardware?.cpu?.temperatureC)) · GPU \(RelayMonitor.formatTemperature(relay.status?.hardware?.gpu?.temperatureC)) · \(relay.menuTitle)"
+                        ? "CPU \(RelayMonitor.formatCpuSummary(load: relay.status?.hardware?.cpu?.loadPercent, temp: relay.status?.hardware?.cpu?.temperatureC)) · RAM \(RelayMonitor.formatPercent(relay.status?.hardware?.memory?.loadPercent)) (\(RelayMonitor.formatBytes(relay.status?.hardware?.memory?.usedBytes ?? 0))/\(RelayMonitor.formatBytes(relay.status?.hardware?.memory?.totalBytes ?? 0))) · GPU \(RelayMonitor.formatTemperature(relay.status?.hardware?.gpu?.temperatureC)) · \(String(format: "%.0f W", relay.status?.hardware?.power?.wallEstimateWatts ?? 0))"
                         : (relay.isConnected ? "Tailscale üzerinden bağlı" : "Bağlantı bekleniyor"),
                     actionTitle: "Ekranı aç",
                     action: relay.openRemoteDesktop,
@@ -11298,7 +11325,7 @@ private struct RelayMenuView: View {
                     VStack(spacing: 9) {
                         MetricRow(
                             title: "CPU",
-                            value: "\(RelayMonitor.formatPercent(hardware.cpu?.loadPercent)) · \(RelayMonitor.formatTemperature(hardware.cpu?.temperatureC)) · \(RelayMonitor.formatPower(hardware.cpu?.powerWatts, estimated: hardware.cpu?.powerSource != "sensor"))"
+                            value: "\(RelayMonitor.formatCpuSummary(load: hardware.cpu?.loadPercent, temp: hardware.cpu?.temperatureC)) · \(RelayMonitor.formatPower(hardware.cpu?.powerWatts, estimated: hardware.cpu?.powerSource != "sensor"))"
                         )
                         MetricRow(
                             title: "GPU",
