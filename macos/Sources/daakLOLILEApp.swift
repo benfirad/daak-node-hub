@@ -2888,47 +2888,129 @@ private final class LocalMacMonitor: ObservableObject {
     }
 }
 
+private struct GCalResponse: Decodable {
+    let account: String?
+    let count: Int?
+    let events: [GCalEvent]
+}
+
+private struct GCalEvent: Decodable, Identifiable {
+    var id: String { uid }
+    let uid: String
+    let title: String
+    let start: String
+    let end: String
+    let allDay: Bool?
+    let location: String?
+    let description: String?
+
+    enum CodingKeys: String, CodingKey {
+        case uid, title, start, end, location, description
+        case allDay = "all_day"
+    }
+
+    var categoryColor: Color {
+        let lower = title.lowercased()
+        if lower.contains("sınav") || lower.contains("convocatoria") { return .red }
+        if lower.contains("itv") || lower.contains("muayene") { return .blue }
+        if lower.contains("práctica") || lower.contains("seminario") || lower.contains("ders") { return .green }
+        if lower.contains("ödeme") || lower.contains("klarna") || lower.contains("taksit") { return .purple }
+        return .orange
+    }
+
+    var categoryIcon: String {
+        let lower = title.lowercased()
+        if lower.contains("sınav") || lower.contains("convocatoria") { return "pencil.and.outline" }
+        if lower.contains("itv") || lower.contains("muayene") { return "car.fill" }
+        if lower.contains("práctica") || lower.contains("seminario") { return "graduationcap.fill" }
+        if lower.contains("ödeme") || lower.contains("klarna") { return "creditcard.fill" }
+        return "calendar"
+    }
+}
+
+@MainActor
+private final class CalendarMonitor: ObservableObject {
+    @Published private(set) var events: [GCalEvent] = []
+    @Published private(set) var lastUpdated: Date?
+    @Published private(set) var isRefreshing = false
+
+    private var timer: Timer?
+
+    init() {
+        timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
+        }
+        timer?.tolerance = 30
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
+        Task { await refresh() }
+    }
+
+    deinit { timer?.invalidate() }
+
+    func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        let result = await LocalCommand.run("/Users/kai/.local/bin/gcal", ["list"])
+        guard result.exitCode == 0,
+              let data = result.output.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(GCalResponse.self, from: data) else {
+            return
+        }
+        self.events = decoded.events
+        self.lastUpdated = Date()
+    }
+}
+
 private enum DevicePanel: String, CaseIterable, Identifiable {
     case devices
     case smartHome
+    case calendar
     case study
     case operations
-    case opportunities
-    case broadcast
+    case deck
     case lolile
     case myaL11
     case node
-    case deck
+    case opportunities
+    case broadcast
 
     var id: String { rawValue }
 
+    static var topLevelCases: [DevicePanel] {
+        [.devices, .smartHome, .calendar, .study, .operations, .deck]
+    }
+
     var title: String {
         switch self {
-        case .devices: return "Merkez"
+        case .devices: return "Cihazlar"
         case .smartHome: return "Ev & TV"
-        case .study: return "Dersler"
+        case .calendar: return "Takvim"
+        case .study: return "Ders & İş"
         case .operations: return "Servisler"
-        case .opportunities: return "Fırsatlar"
-        case .broadcast: return "Yayın"
+        case .deck: return "Deck"
         case .lolile: return "LOLİLE"
         case .myaL11: return "MYA-L11"
         case .node: return "Vaytniga"
-        case .deck: return "Deck"
+        case .opportunities: return "Fırsatlar"
+        case .broadcast: return "Yayın"
         }
     }
 
     var symbol: String {
         switch self {
-        case .devices: return "square.grid.2x2.fill"
-        case .smartHome: return "lightbulb.led.wide.fill"
+        case .devices: return "desktopcomputer"
+        case .smartHome: return "tv.and.mediabox"
+        case .calendar: return "calendar"
         case .study: return "graduationcap.fill"
         case .operations: return "server.rack"
-        case .opportunities: return "scope"
-        case .broadcast: return "dot.radiowaves.left.and.right"
+        case .deck: return "square.grid.3x2.fill"
         case .lolile: return "desktopcomputer"
         case .myaL11: return "laptopcomputer"
         case .node: return "iphone"
-        case .deck: return "rectangle.grid.3x2.fill"
+        case .opportunities: return "scope"
+        case .broadcast: return "dot.radiowaves.left.and.right"
         }
     }
 }
@@ -3423,37 +3505,46 @@ private struct DAAKPanelPicker: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 3) {
-            ForEach(DevicePanel.allCases) { panel in
+        HStack(spacing: 4) {
+            ForEach(DevicePanel.topLevelCases) { panel in
+                let isSelected = selection == panel || (
+                    (panel == .devices && (selection == .lolile || selection == .myaL11 || selection == .node)) ||
+                    (panel == .operations && (selection == .broadcast || selection == .opportunities))
+                )
                 Button {
                     guard selection != panel else { return }
                     withAnimation(reduceMotion ? .easeOut(duration: 0.14) : .interactiveSpring(response: 0.34, dampingFraction: 1)) {
                         selection = panel
                     }
                 } label: {
-                    Image(systemName: panel.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(selection == panel ? Color.primary : Color.secondary)
+                    VStack(spacing: 3) {
+                        Image(systemName: panel.symbol)
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(panel.title)
+                            .font(.system(size: 9, weight: isSelected ? .bold : .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
+                    .padding(.vertical, 6)
                     .contentShape(Rectangle())
                     .background {
-                        if selection == panel {
+                        if isSelected {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .fill(.regularMaterial)
                                 .matchedGeometryEffect(id: "panel-selection", in: selectionSurface)
-                                .shadow(color: .black.opacity(0.13), radius: 2, y: 1)
+                                .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
                         }
                     }
                 }
                 .buttonStyle(DAAKPressStyle())
                 .help(panel.title)
                 .accessibilityLabel(panel.title)
-                .accessibilityAddTraits(selection == panel ? .isSelected : [])
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
             }
         }
         .padding(3)
-        .background(.quaternary.opacity(0.8), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 }
 
@@ -3625,41 +3716,41 @@ private struct DeviceCard: View {
     let openDetails: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             Button(action: openDetails) {
                 HStack(spacing: 12) {
                     Image(systemName: symbol)
-                        .font(.system(size: 24, weight: .medium))
+                        .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(online ? Color.green : Color.orange)
-                        .frame(width: 38, height: 38)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                        .frame(width: 36, height: 36)
+                        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(name)
-                            .font(.headline)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(name)
+                                .font(.headline)
+                            Circle()
+                                .fill(online ? Color.green : Color.orange)
+                                .frame(width: 7, height: 7)
+                        }
                         Text(detail)
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
 
                     Spacer()
 
-                    VStack(alignment: .trailing, spacing: 5) {
-                        Circle()
-                            .fill(online ? Color.green : Color.orange)
-                            .frame(width: 8, height: 8)
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(DAAKPressStyle())
 
-            HStack {
+            HStack(alignment: .center) {
                 Text(status)
-                    .font(.caption)
+                    .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 Spacer()
@@ -3668,13 +3759,12 @@ private struct DeviceCard: View {
                     .controlSize(.small)
             }
         }
-        .padding(13)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(0.07), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(online ? Color.green.opacity(0.18) : Color.white.opacity(0.06), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
     }
 }
 
@@ -3685,205 +3775,72 @@ private struct DeviceOverviewView: View {
     @EnvironmentObject private var localMac: LocalMacMonitor
     @EnvironmentObject private var smartHome: SmartHomeMonitor
     @EnvironmentObject private var study: UniversityStudyMonitor
+    @EnvironmentObject private var calendar: CalendarMonitor
     @Binding var selection: DevicePanel
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("SUNUCU & EV DURUMU").font(.caption.weight(.bold))
-                        Text("Güç, sıcaklık, aydınlatma, TV ve sınavlar tek bakışta")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
+            VStack(spacing: 12) {
+                // TV & Takvim Canlı Özet Çubuğu
+                HStack(spacing: 10) {
                     Button {
-                        smartHome.openCommandCenterWindow?()
+                        selection = .smartHome
                     } label: {
-                        Label("Komuta Merkezi", systemImage: "macwindow.badge.plus")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.indigo)
-                    .controlSize(.small)
-                }
-
-                if let status = myaL11.status {
-                    HStack(spacing: 10) {
-                        Image(systemName: myaL11.isOnBattery ? "exclamationmark.triangle.fill" : "battery.100percent.bolt")
-                            .font(.title3)
-                            .foregroundStyle(myaL11.isOnBattery ? Color.orange : Color.green)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(myaL11.isOnBattery ? "UPS DEVREDE" : "UPS HAZIR")
-                                .font(.callout.weight(.bold))
-                            Text(myaL11.upsSummary)
-                                .font(.caption2)
-                                .foregroundStyle(myaL11.isOnBattery ? Color.orange : Color.secondary)
-                        }
-                        Spacer()
-                        if myaL11.isOnBattery, let minutes = status.batteryMinutesRemaining, minutes >= 0 {
-                            Text("≈ \(minutes) dk")
-                                .font(.headline.monospacedDigit())
-                                .foregroundStyle(.orange)
-                        } else {
-                            Text("%\(status.batteryPercent)")
-                                .font(.headline.monospacedDigit())
-                        }
-                    }
-                    .padding(12)
-                    .background(
-                        (myaL11.isOnBattery ? Color.orange : Color.green).opacity(0.12),
-                        in: RoundedRectangle(cornerRadius: 13)
-                    )
-                }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Button {
-                            selection = .smartHome
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: "lightbulb.led.wide.fill")
-                                    .font(.system(size: 20, weight: .semibold))
-                                    .foregroundStyle(smartHome.anyLightOn ? Color.yellow : Color.orange)
-                                    .frame(width: 36, height: 36)
-                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("PHILIPS HUE & TCL 4K TV")
-                                        .font(.subheadline.weight(.bold))
-                                    Text(smartHome.quickSummary)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                Spacer()
-                                Circle()
-                                    .fill(smartHome.hueOnline ? Color.green : Color.orange)
-                                    .frame(width: 8, height: 8)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(DAAKPressStyle())
-                    }
-
-                    HStack(spacing: 6) {
-                        Button {
-                            Task { await smartHome.setAllLights(on: true) }
-                        } label: {
-                            Label("Işık Aç", systemImage: "sun.max.fill")
-                        }
-                        Button {
-                            Task { await smartHome.setAllLights(on: false) }
-                        } label: {
-                            Label("Kapat", systemImage: "moon.fill")
-                        }
-                        Button {
-                            Task { await smartHome.startCinemaMode(app: "stremio") }
-                        } label: {
-                            Label("Sinema", systemImage: "film.fill")
-                        }
-                        .tint(.purple)
-                        Button {
-                            Task { await smartHome.tvArtMode() }
-                        } label: {
-                            Label("Tablo", systemImage: "photo.artframe")
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                .padding(12)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(.white.opacity(0.07), lineWidth: 0.5)
-                }
-
-                // Live Vaytniga S9+ Modem Card (5 sn yenileme)
-                Button {
-                    selection = .smartHome
-                } label: {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "antenna.radiowaves.left.and.right")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(smartHome.modem?.online == true ? Color.green : Color.orange)
-                                .frame(width: 36, height: 36)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("VAYTNIGA S9+ MODEM · CANLI")
-                                    .font(.subheadline.weight(.bold))
-                                Text(smartHome.modem.map { "\($0.operatorName) · \($0.signalQualityLabel)" } ?? "ADB bağlantısı bekleniyor")
+                        HStack(spacing: 8) {
+                            Image(systemName: "tv.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(smartHome.tvOnline ? .green : .orange)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("TCL TV")
+                                    .font(.caption.weight(.bold))
+                                Text(smartHome.tvOnline ? "Açık · Mod Hazır" : "Uyku Modu")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer()
-                            if smartHome.isRefreshingModem {
-                                ProgressView().controlSize(.mini)
-                            }
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-                        if let modem = smartHome.modem, modem.online {
-                            HStack(spacing: 0) {
-                                modemStat(title: "İndirme", value: modem.liveDownloadLabel, tint: .green)
-                                modemStat(title: "Yükleme", value: modem.liveUploadLabel, tint: .blue)
-                                modemStat(title: "Ping", value: modem.pingLabel, tint: modem.pingMs > 150 || modem.pingMs == 0 ? .orange : .mint)
-                                modemStat(title: "Cihaz", value: "\(modem.clients)", tint: .secondary)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
-                    .padding(12)
-                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(.white.opacity(0.07), lineWidth: 0.5)
-                    }
-                }
-                .buttonStyle(DAAKPressStyle())
+                    .buttonStyle(DAAKPressStyle())
 
-                // Upcoming Exams & Course Notes Quick Card
-                Button {
-                    selection = .study
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "graduationcap.fill")
-                            .font(.system(size: 19, weight: .semibold))
-                            .foregroundStyle(.mint)
-                            .frame(width: 36, height: 36)
-                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("DERS NOTLARI & YAKLAŞAN SINAVLAR")
-                                .font(.subheadline.weight(.bold))
-                            Text(study.nextExamBannerText)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                    Button {
+                        selection = .calendar
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "calendar")
+                                .font(.subheadline)
+                                .foregroundStyle(.blue)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("TAKVİM")
+                                    .font(.caption.weight(.bold))
+                                Text("\(calendar.events.count) Etkinlik")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                        Spacer()
-                        Text("%\(study.overallReadinessPercent) hazır")
-                            .font(.caption2.monospacedDigit().weight(.bold))
-                            .foregroundStyle(.mint)
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
-                    .padding(12)
-                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(.white.opacity(0.07), lineWidth: 0.5)
-                    }
+                    .buttonStyle(DAAKPressStyle())
                 }
-                .buttonStyle(DAAKPressStyle())
+
+                // 4 Ana Cihaz (Tamamen Aynı Standartta)
+                DeviceCard(
+                    name: "BU MAC (M3)",
+                    detail: "Ana Makine · Yerel macOS · İş İstasyonu",
+                    symbol: "laptopcomputer",
+                    online: true,
+                    status: localMac.summary + (localMac.health?.batteryTemperatureC.map { String(format: " · Pil %.0f°C", $0) } ?? ""),
+                    actionTitle: "Aktivite",
+                    action: { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")) },
+                    openDetails: {}
+                )
 
                 DeviceCard(
                     name: "LOLİLE",
-                    detail: "Windows · Relay · Uzaktan kontrol",
+                    detail: "Windows 11 Master · Relay · Uzaktan Kontrol",
                     symbol: "desktopcomputer",
                     online: relay.isConnected,
                     status: relay.status?.hardware?.available == true
@@ -3896,8 +3853,8 @@ private struct DeviceOverviewView: View {
 
                 DeviceCard(
                     name: "MYA-L11",
-                    detail: "Intel Mac · Sunucu · Ekran · Disk",
-                    symbol: "laptopcomputer",
+                    detail: "Intel Mac · 24/7 Sunucu · Ekran & Disk",
+                    symbol: "server.rack",
                     online: myaL11.isOnline,
                     status: myaL11.overviewSummary,
                     actionTitle: "Ekranı aç",
@@ -3906,8 +3863,8 @@ private struct DeviceOverviewView: View {
                 )
 
                 DeviceCard(
-                    name: "DAAK NODE",
-                    detail: "Vaytniga · Find · SSH · Canlı ekran",
+                    name: "VAYTNIGA (S9+)",
+                    detail: "Modem DAAK Node · ADB · Canlı Ekran",
                     symbol: "iphone",
                     online: node.isOnline,
                     status: node.healthSummary,
@@ -3915,23 +3872,6 @@ private struct DeviceOverviewView: View {
                     action: { Task { await node.openLiveScreen() } },
                     openDetails: { selection = .node }
                 )
-
-                HStack(spacing: 10) {
-                    Image(systemName: "laptopcomputer")
-                        .foregroundStyle(.green)
-                        .frame(width: 26)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("BU MAC").font(.caption.weight(.semibold))
-                        Text(localMac.summary).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if let temp = localMac.health?.batteryTemperatureC {
-                        Text(String(format: "Pil %.0f°C", temp))
-                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                    }
-                }
-                .padding(10)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 11))
 
                 Divider()
 
@@ -3942,12 +3882,13 @@ private struct DeviceOverviewView: View {
                             async let nodeRefresh: Void = node.refresh()
                             async let myaRefresh: Void = myaL11.refresh()
                             async let homeRefresh: Void = smartHome.refresh()
-                            _ = await (relayRefresh, nodeRefresh, myaRefresh, homeRefresh)
+                            async let calRefresh: Void = calendar.refresh()
+                            _ = await (relayRefresh, nodeRefresh, myaRefresh, homeRefresh, calRefresh)
                         }
                     } label: {
                         Label("Tümünü yenile", systemImage: "arrow.clockwise")
                     }
-                    .disabled(relay.isRefreshing || node.isRefreshing || myaL11.isRefreshing || smartHome.isRefreshing)
+                    .disabled(relay.isRefreshing || node.isRefreshing || myaL11.isRefreshing || smartHome.isRefreshing || calendar.isRefreshing)
 
                     Spacer()
 
@@ -3960,20 +3901,6 @@ private struct DeviceOverviewView: View {
             .padding(16)
         }
         .frame(maxHeight: 690)
-    }
-
-    private func modemStat(title: String, value: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(title)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption.weight(.bold).monospacedDigit())
-                .foregroundStyle(tint)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -5156,6 +5083,10 @@ final class SmartHomeMonitor: ObservableObject {
         lights.contains(where: \.on)
     }
 
+    var tvOnline: Bool {
+        tv?.online == true
+    }
+
     var masterBrightness: Double {
         guard !lights.isEmpty else { return 200 }
         let sum = lights.reduce(0) { $0 + $1.bri }
@@ -6178,6 +6109,159 @@ private struct PDFKitInlineView: NSViewRepresentable {
         if pdfView.document?.documentURL != url {
             pdfView.document = PDFDocument(url: url)
         }
+    }
+}
+
+private struct DAAKCalendarView: View {
+    @EnvironmentObject private var calendar: CalendarMonitor
+    @EnvironmentObject private var smartHome: SmartHomeMonitor
+
+    private var todayFormatted: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "tr_TR")
+        formatter.dateFormat = "d MMMM yyyy, EEEE"
+        return formatter.string(from: Date())
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                // Header Banner
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(todayFormatted)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text("Google Calendar & TCL TV Canlı Senkronizasyon")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        Task { await calendar.refresh() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if calendar.isRefreshing {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            Text("Yenile")
+                        }
+                        .font(.caption2.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 4)
+
+                // TV Entegrasyon Rozeti
+                HStack(spacing: 8) {
+                    Image(systemName: "tv.fill")
+                        .foregroundStyle(.indigo)
+                        .font(.subheadline)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("TCL TV Tablo & Screensaver Entegrasyonu")
+                            .font(.caption.weight(.semibold))
+                        Text("Buradaki etkinlikler TV dinlenme ekranında otomatik gösterilir.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(smartHome.tvOnline ? Color.green : Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text(smartHome.tvOnline ? "TV Açık" : "TV Uyku")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(smartHome.tvOnline ? .green : .orange)
+                    }
+                }
+                .padding(10)
+                .background(.indigo.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                // Etkinlik Listesi
+                if calendar.events.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "calendar.badge.clock")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text(calendar.isRefreshing ? "Etkinlikler yükleniyor..." : "Yaklaşan etkinlik bulunamadı.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 180)
+                } else {
+                    VStack(spacing: 10) {
+                        ForEach(calendar.events) { ev in
+                            CalendarEventCard(event: ev)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+    }
+}
+
+private struct CalendarEventCard: View {
+    let event: GCalEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            // Renk şeridi
+            RoundedRectangle(cornerRadius: 3)
+                .fill(event.categoryColor)
+                .frame(width: 4)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline) {
+                    Image(systemName: event.categoryIcon)
+                        .font(.caption)
+                        .foregroundStyle(event.categoryColor)
+                    Text(event.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("\(event.start) - \(event.end)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                if let loc = event.location, !loc.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "mappin.and.ellipse")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(loc)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                if let desc = event.description, !desc.isEmpty {
+                    Text(desc)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.85))
+                        .lineLimit(2)
+                        .padding(.top, 2)
+                }
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(event.categoryColor.opacity(0.25), lineWidth: 1)
+        )
     }
 }
 
@@ -11174,6 +11258,7 @@ private struct DAAKDevicesMenuView: View {
     @EnvironmentObject private var broadcast: BroadcastMonitor
     @EnvironmentObject private var smartHome: SmartHomeMonitor
     @EnvironmentObject private var study: UniversityStudyMonitor
+    @EnvironmentObject private var calendar: CalendarMonitor
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var selection: DevicePanel = .devices
@@ -11221,6 +11306,8 @@ private struct DAAKDevicesMenuView: View {
                     DeviceOverviewView(selection: $selection)
                 case .smartHome:
                     SmartHomeView()
+                case .calendar:
+                    DAAKCalendarView()
                 case .study:
                     UniversityStudyPopoverView()
                 case .operations:
@@ -11634,6 +11721,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
     private let smartHome = SmartHomeMonitor()
     private let study = UniversityStudyMonitor()
     private let expense = ExpenseMonitor()
+    private let calendar = CalendarMonitor()
 
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
@@ -11658,6 +11746,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(smartHome)
             .environmentObject(study)
             .environmentObject(expense)
+            .environmentObject(calendar)
 
         popover.behavior = .transient
         popover.animates = true
@@ -11713,6 +11802,7 @@ private final class DAAKStatusBarController: NSObject, NSApplicationDelegate {
             .environmentObject(smartHome)
             .environmentObject(study)
             .environmentObject(expense)
+            .environmentObject(calendar)
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1360, height: 860),
