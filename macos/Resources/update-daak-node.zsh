@@ -105,6 +105,13 @@ if [[ "$mode" != '--install' ]]; then
   exit 64
 fi
 
+if [[ -d "$lock_dir" ]]; then
+  lock_age=$(($(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || date +%s)))
+  if (( lock_age > 300 )); then
+    rm -rf "$lock_dir" 2>/dev/null || true
+  fi
+fi
+
 if ! mkdir "$lock_dir" 2>/dev/null; then
   json_result busy "$current" "$latest" 'Başka bir güncelleme zaten çalışıyor.'
   exit 0
@@ -142,8 +149,6 @@ fi
   launch_agent="$HOME/Library/LaunchAgents/app.daaknode.system-ui.plist"
   launch_domain="gui/$(id -u)"
   launch_label='app.daaknode.system-ui'
-  /bin/launchctl bootout "$launch_domain/$launch_label" 2>/dev/null || true
-  /usr/bin/pkill -x daakLOLILE 2>/dev/null || true
 
   backup_dir="$cache_dir/previous"
   mkdir -p "$backup_dir"
@@ -153,11 +158,9 @@ fi
   fi
   if ! /bin/mv "$staging" "$app"; then
     [[ ! -e "$app" && -e "$backup" ]] && /bin/mv "$backup" "$app"
-    /bin/launchctl bootstrap "$launch_domain" "$launch_agent" 2>/dev/null || true
     exit 4
   fi
-  /bin/launchctl bootstrap "$launch_domain" "$launch_agent"
-  /bin/launchctl kickstart -k "$launch_domain/$launch_label"
+  ( sleep 1.5 && /bin/launchctl kickstart -k "$launch_domain/$launch_label" 2>/dev/null || open "$app" ) >/dev/null 2>&1 &
   printf '%s update-installed commit=%s backup=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$latest" "$backup"
 } >>"$log_file" 2>&1
 
