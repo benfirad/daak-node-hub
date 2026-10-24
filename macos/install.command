@@ -39,7 +39,7 @@ cat > "$launch_agent" <<PLIST
     <string>HOME=$HOME</string>
     <string>USER=$(/usr/bin/id -un)</string>
     <string>LOGNAME=$(/usr/bin/id -un)</string>
-    <string>PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>PATH=$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <string>ADB=/opt/homebrew/bin/adb</string>
     <string>LANG=en_US.UTF-8</string>
     <string>TMPDIR=/tmp</string>
