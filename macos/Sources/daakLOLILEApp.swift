@@ -5336,7 +5336,6 @@ final class SmartHomeMonitor: ObservableObject {
 
     func sendTVKey(_ key: String) async {
         _ = await LocalCommand.run("/Users/kai/bin/daak-tv", ["key", key])
-        await refresh()
     }
 
     func startCinemaMode(app: String) async {
@@ -7024,6 +7023,393 @@ private struct UniversityCommandCenterView: View {
     }
 }
 
+private struct TCLSmartTVRemoteCard: View {
+    @EnvironmentObject private var smartHome: SmartHomeMonitor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // 1. Üst Başlık & Canlı Durum & Güç Butonları
+            HStack(alignment: .center, spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(LinearGradient(colors: [.cyan.opacity(0.3), .blue.opacity(0.18)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: "tv.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.cyan)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("TCL 50\" 4K SMART TV PRO")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                        Circle()
+                            .fill(smartHome.tv?.online == true ? (smartHome.tv?.isAwake == true ? Color.green : Color.orange) : Color.red)
+                            .frame(width: 7, height: 7)
+                    }
+                    Text(smartHome.tv?.online == true
+                         ? "\(smartHome.tv?.activeAppLabel ?? "Açık") · 192.168.34.182 · Wi-Fi 5GHz"
+                         : "Çevrimdışı / Bağlantı bekleniyor")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                HStack(spacing: 6) {
+                    Button {
+                        Task {
+                            if smartHome.tv?.isAwake == true {
+                                await smartHome.tvSleep()
+                            } else {
+                                await smartHome.tvWake()
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "power")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(smartHome.tv?.isAwake == true ? Color.green : Color.red)
+                            .frame(width: 30, height: 30)
+                            .background(.quaternary, in: Circle())
+                    }
+                    .buttonStyle(DAAKPressStyle())
+                    .help(smartHome.tv?.isAwake == true ? "TV'yi Uyut" : "TV'yi Uyandır")
+
+                    Button {
+                        Task { await smartHome.tvArtMode() }
+                    } label: {
+                        Image(systemName: "photo.artframe")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.orange)
+                            .frame(width: 30, height: 30)
+                            .background(.quaternary, in: Circle())
+                    }
+                    .buttonStyle(DAAKPressStyle())
+                    .help("The Frame Tablo Modu")
+                }
+            }
+
+            Divider().opacity(0.6)
+
+            // 2. Akıllı Kumanda Gövdesi (Ergonomik Apple TV Remote / D-Pad Tasarımı)
+            VStack(spacing: 12) {
+                HStack(alignment: .center, spacing: 18) {
+                    // Sol Sütun: Ses Kontrolleri (Ses +, Mute, Ses -)
+                    VStack(spacing: 6) {
+                        Button {
+                            Task { await smartHome.sendTVKey("volup") }
+                        } label: {
+                            Image(systemName: "speaker.plus.fill")
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(width: 44, height: 38)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("Ses Yükselt")
+
+                        Button {
+                            Task { await smartHome.sendTVKey("mute") }
+                        } label: {
+                            Image(systemName: "speaker.slash.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .frame(width: 44, height: 32)
+                                .background(.quaternary.opacity(0.8), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("Sessize Al (Mute)")
+
+                        Button {
+                            Task { await smartHome.sendTVKey("voldown") }
+                        } label: {
+                            Image(systemName: "speaker.minus.fill")
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(width: 44, height: 38)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("Ses Kıs")
+                    }
+
+                    // Orta Bölüm: D-Pad / Yön Tuşları ve OK
+                    VStack(spacing: 4) {
+                        Button {
+                            Task { await smartHome.sendTVKey("up") }
+                        } label: {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 14, weight: .heavy))
+                                .foregroundStyle(.primary)
+                                .frame(width: 54, height: 34)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+
+                        HStack(spacing: 4) {
+                            Button {
+                                Task { await smartHome.sendTVKey("left") }
+                            } label: {
+                                Image(systemName: "chevron.left")
+                                    .font(.system(size: 14, weight: .heavy))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 44, height: 46)
+                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            }
+                            .buttonStyle(DAAKPressStyle())
+
+                            Button {
+                                Task { await smartHome.sendTVKey("ok") }
+                            } label: {
+                                ZStack {
+                                    Circle()
+                                        .fill(LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                        .frame(width: 50, height: 50)
+                                        .shadow(color: .cyan.opacity(0.4), radius: 6, y: 2)
+                                    Text("OK")
+                                        .font(.system(size: 13, weight: .heavy, design: .rounded))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .buttonStyle(DAAKPressStyle())
+
+                            Button {
+                                Task { await smartHome.sendTVKey("right") }
+                            } label: {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 14, weight: .heavy))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 44, height: 46)
+                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            }
+                            .buttonStyle(DAAKPressStyle())
+                        }
+
+                        Button {
+                            Task { await smartHome.sendTVKey("down") }
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 14, weight: .heavy))
+                                .foregroundStyle(.primary)
+                                .frame(width: 54, height: 34)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                    }
+
+                    // Sağ Sütun: Medya Oynatma (Oynat/Dur, Geri Sar, İleri Sar)
+                    VStack(spacing: 6) {
+                        Button {
+                            Task { await smartHome.sendTVKey("playpause") }
+                        } label: {
+                            Image(systemName: "playpause.fill")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(.cyan)
+                                .frame(width: 44, height: 38)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("Oynat / Duraklat")
+
+                        Button {
+                            Task { await smartHome.sendTVKey("rewind") }
+                        } label: {
+                            Image(systemName: "backward.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 44, height: 32)
+                                .background(.quaternary.opacity(0.8), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("Geri Sar")
+
+                        Button {
+                            Task { await smartHome.sendTVKey("forward") }
+                        } label: {
+                            Image(systemName: "forward.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 44, height: 38)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(DAAKPressStyle())
+                        .help("İleri Sar")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+
+                // Navigasyon Çubuğu: Geri · Ana Ekran · Menü
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await smartHome.sendTVKey("back") }
+                    } label: {
+                        Label("Geri", systemImage: "arrow.uturn.backward")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 32)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        Task { await smartHome.sendTVKey("home") }
+                    } label: {
+                        Label("Ana Ekran", systemImage: "house.fill")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 32)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.cyan.opacity(0.8))
+                    .controlSize(.small)
+
+                    Button {
+                        Task { await smartHome.sendTVKey("menu") }
+                    } label: {
+                        Label("Menü", systemImage: "line.3.horizontal")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 32)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            // 3. Panel Parlaklığı & Hızlı Ön Ayarlar
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("Panel Parlaklığı", systemImage: "sun.max.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("%\(Int((smartHome.tvBrightness * 100).rounded()))")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(.cyan)
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: "sun.min.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Slider(
+                        value: Binding(
+                            get: { smartHome.tvBrightness },
+                            set: { smartHome.tvBrightness = $0 }
+                        ),
+                        in: 0.05...1.0
+                    ) { editing in
+                        if !editing {
+                            Task { await smartHome.setTVBrightness(smartHome.tvBrightness) }
+                        }
+                    }
+                    Image(systemName: "sun.max.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 6) {
+                    presetBrightnessButton("Gece %5", value: 0.05)
+                    presetBrightnessButton("Sinema %35", value: 0.35)
+                    presetBrightnessButton("Normal %70", value: 0.70)
+                    presetBrightnessButton("Canlı %100", value: 1.0)
+                }
+            }
+
+            // 4. Akıllı Akış Uygulamaları Dock'u (Streaming Hub)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("AKILLI UYGULAMALAR & AKIŞLAR")
+                    .font(.system(size: 10, weight: .heavy))
+                    .foregroundStyle(.secondary)
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                    appDockButton("YouTube", app: "youtube", icon: "play.rectangle.fill", tint: .red)
+                    appDockButton("Stremio", app: "stremio", icon: "film.fill", tint: .purple)
+                    appDockButton("Nuvio", app: "nuvio", icon: "sparkles.tv.fill", tint: .indigo)
+                    appDockButton("Disney+", app: "disney", icon: "film.stack.fill", tint: .blue)
+                    appDockButton("TOD", app: "tod", icon: "sportscourt.fill", tint: .green)
+                    appDockButton("TV+", app: "tvplus", icon: "antenna.radiowaves.left.and.right", tint: .cyan)
+                }
+            }
+
+            // 5. Tek Tıkla Sinema & The Frame Senaryoları
+            HStack(spacing: 8) {
+                Button {
+                    Task { await smartHome.startCinemaMode(app: "stremio") }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "popcorn.fill")
+                        Text("Sinema (Stremio)")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+                .controlSize(.small)
+
+                Button {
+                    Task { await smartHome.tvArtMode() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "photo.artframe")
+                        Text("The Frame Tablo")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(smartHome.tv?.online == true ? Color.cyan.opacity(0.2) : Color.white.opacity(0.06), lineWidth: 1)
+        }
+    }
+
+    private func presetBrightnessButton(_ label: String, value: Double) -> some View {
+        Button {
+            Task { await smartHome.setTVBrightness(value) }
+        } label: {
+            Text(label)
+                .font(.system(size: 9.5, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.mini)
+    }
+
+    private func appDockButton(_ title: String, app: String, icon: String, tint: Color) -> some View {
+        Button {
+            Task { await smartHome.launchTVApp(app) }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundStyle(tint)
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(tint.opacity(0.25), lineWidth: 0.5)
+            }
+        }
+        .buttonStyle(DAAKPressStyle())
+    }
+}
+
 private struct SmartHomeView: View {
     @EnvironmentObject private var smartHome: SmartHomeMonitor
     @State private var masterBriDraft: Double = 200
@@ -7136,117 +7522,8 @@ private struct SmartHomeView: View {
                 .padding(12)
                 .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                // TCL 4K Smart TV Pro Card
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("TCL 4K Smart TV Pro", systemImage: "tv.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.cyan)
-                        Spacer()
-                        StatusPill(
-                            online: smartHome.tv?.online == true,
-                            onlineText: smartHome.tv?.activeAppLabel ?? "Açık",
-                            offlineText: "Kapalı"
-                        )
-                    }
-
-                    HStack(spacing: 6) {
-                        Button {
-                            Task { await smartHome.tvWake() }
-                        } label: {
-                            Label("Uyandır", systemImage: "power")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.cyan)
-                        .controlSize(.small)
-
-                        Button {
-                            Task { await smartHome.tvArtMode() }
-                        } label: {
-                            Label("The Frame Art", systemImage: "photo.artframe")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button {
-                            Task { await smartHome.tvSleep() }
-                        } label: {
-                            Label("Uyut", systemImage: "moon.zzz.fill")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    Text("Uygulama Başlatıcı & Sinema Modu")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
-                        tvAppButton("Stremio", app: "stremio", icon: "play.tv.fill")
-                        tvAppButton("Nuvio", app: "nuvio", icon: "sparkles.tv.fill")
-                        tvAppButton("YouTube", app: "youtube", icon: "play.rectangle.fill")
-                        tvAppButton("Disney+", app: "disney", icon: "film.stack.fill")
-                        tvAppButton("TOD", app: "tod", icon: "sportscourt.fill")
-                        tvAppButton("TV+", app: "tvplus", icon: "antenna.radiowaves.left.and.right")
-                    }
-
-                    HStack(spacing: 6) {
-                        Button {
-                            Task { await smartHome.startCinemaMode(app: "stremio") }
-                        } label: {
-                            Label("Sinema + Stremio", systemImage: "popcorn.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.purple)
-                        .controlSize(.small)
-
-                        Button {
-                            Task { await smartHome.startCinemaMode(app: "nuvio") }
-                        } label: {
-                            Label("Sinema + Nuvio", systemImage: "wand.and.stars")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.indigo)
-                        .controlSize(.small)
-                    }
-
-                    Divider()
-
-                    // Remote & Brightness
-                    HStack(spacing: 6) {
-                        tvKeyButton("Geri", key: "KEYCODE_BACK", icon: "arrow.uturn.backward")
-                        tvKeyButton("Ana Ekran", key: "KEYCODE_HOME", icon: "house.fill")
-                        tvKeyButton("Oynat/Dur", key: "KEYCODE_MEDIA_PLAY_PAUSE", icon: "playpause.fill")
-                        tvKeyButton("Ses -", key: "KEYCODE_VOLUME_DOWN", icon: "speaker.minus.fill")
-                        tvKeyButton("Ses +", key: "KEYCODE_VOLUME_UP", icon: "speaker.plus.fill")
-                    }
-
-                    HStack(spacing: 8) {
-                        Image(systemName: "sun.min.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Slider(
-                            value: Binding(
-                                get: { smartHome.tvBrightness },
-                                set: { smartHome.tvBrightness = $0 }
-                            ),
-                            in: 0.05...1.0
-                        ) { editing in
-                            if !editing {
-                                Task { await smartHome.setTVBrightness(smartHome.tvBrightness) }
-                            }
-                        }
-                        Text("%\(Int((smartHome.tvBrightness * 100).rounded()))")
-                            .font(.caption2.monospacedDigit())
-                            .frame(width: 34, alignment: .trailing)
-                    }
-                }
-                .padding(12)
-                .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                // TCL 4K Smart TV Pro Remote Card (Apple TV / Modern Ergonomic Controller)
+                TCLSmartTVRemoteCard()
 
                 // Vaytniga S9+ Modem & RM-OS Card
                 VStack(alignment: .leading, spacing: 8) {
